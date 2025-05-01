@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Nexora API Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .controls {
+            margin-bottom: 20px;
+            padding: 15px;
+            border: 1px solid #eee;
+            border-radius: 5px;
+        }
+        .session-info {
+            margin: 10px 0;
+            padding: 8px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+        }
+        #response {
+            white-space: pre-wrap;
+            background-color: #f5f5f5;
+            padding: 15px;
+            border-radius: 5px;
+            min-height: 200px;
+            border: 1px solid #ddd;
+            line-height: 1.5;
+        }
+        button {
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:disabled {
+            background-color: #cccccc;
+        }
+        button:hover:not(:disabled) {
+            background-color: #45a049;
+        }
+        input[type="text"] {
+            padding: 8px;
+            width: 100%;
+            margin: 5px 0;
+            box-sizing: border-box;
+        }
+        .typing {
+            color: #333;
+        }
+        .typing::after {
+            content: '|';
+            animation: blink 1s step-end infinite;
+        }
+        @keyframes blink {
+            from, to { opacity: 1; }
+            50% { opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Nexora API Test</h1>
+    <div class="controls">
+        <h3>Step 1: Start a Chat</h3>
+        <input type="text" id="initialMessage" placeholder="Initial message to start a chat">
+        <button onclick="startNewSession()">Start Chat</button>
+    </div>
+    
+    <div class="controls">
+        <h3>Step 2: Continue the Conversation</h3>
+        <div class="session-info">
+            <strong>Session ID:</strong> <span id="currentSessionId">None</span>
+        </div>
+        <input type="text" id="message" placeholder="Your message">
+        <button id="sendBtn" onclick="sendMessage()" disabled>Send</button>
+    </div>
+    
+    <div class="controls">
+        <h3>Step 3: Edit Messages</h3>
+        <input type="text" id="messageId" placeholder="Message ID to edit">
+        <input type="text" id="newMessage" placeholder="New message content">
+        <button id="editBtn" onclick="editMessage()" disabled>Edit Message</button>
+    </div>
+    
+    <h3>Response:</h3>
+    <pre id="response">No response yet</pre>
+
+    <script>
+        // Global state
+        let isStreaming = false;
+        let streamBuffer = '';
+        let responseMetadata = {};
+        const responseElement = document.getElementById('response');
+        const sessionIdElement = document.getElementById('currentSessionId');
+        const sendButton = document.getElementById('sendBtn');
+        const editButton = document.getElementById('editBtn');
+        
+        // Extract session ID from response
+        function extractSessionId(text) {
+            try {
+                // Look for any UUID pattern in the response
+                const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+                const matches = text.match(uuidPattern);
+                if (matches && matches.length > 0) {
+                    return matches[0];
+                }
+                return null;
+            } catch (e) {
+                console.error('Error extracting session ID:', e);
+                return null;
+            }
+        }
+        
+        // Update UI with typing indicator
+        function startTypingIndicator() {
+            responseElement.classList.add('typing');
+        }
+        
+        function stopTypingIndicator() {
+            responseElement.classList.remove('typing');
+        }
+        
+        // Process streamed data
+        function processStreamedData(text) {
+            streamBuffer += text;
+            
+            // Process complete SSE messages
+            const messages = streamBuffer.split('\n\n');
+            streamBuffer = messages.pop() || ''; // Keep the incomplete part
+            
+            for (const message of messages) {
+                if (message.startsWith('data: ')) {
+                    const data = message.substring(6); // Remove 'data: ' prefix
+                    
+                    // Handle special messages
+                    if (data === '[DONE]') {
+                        stopTypingIndicator();
+                        isStreaming = false;
+                        console.log('Stream completed');
+                    } 
+                    else if (data.startsWith('Error:')) {
+                        responseElement.textContent += '\n' + data;
+                        stopTypingIndicator();
+                    }
+                    else if (data.startsWith('New session created with ID:')) {
+                        // Extract and set session ID
+                        const sessionId = extractSessionId(data);
+                        if (sessionId) {
+                            sessionIdElement.textContent = sessionId;
+                            sendButton.disabled = false;
+                            editButton.disabled = false;
+                            
+                            // Clear the response area for the upcoming agent response
+                            responseElement.textContent = '';
+                            startTypingIndicator();
+                        }
+                    }
+                    else if (data.startsWith('ResponseType:')) {
+                        // Metadata about the response
+                        const agentType = data.substring('ResponseType:'.length).trim();
+                        responseMetadata.agentType = agentType;
+                        console.log(`Response coming from: ${agentType}`);
+                    }
+                    else {
+                        // Regular streaming data - append to response
+                        responseElement.textContent += data;
+                    }
+                }
+            }
+        }
+        
+        // Handle streaming response
+        function handleStreamResponse(response) {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            
+            isStreaming = true;
+            startTypingIndicator();
+            
+            function processChunk() {
+                if (!isStreaming) return;
+                
+                return reader.read().then(({value, done}) => {
+                    if (done) {
+                        console.log('Stream ended');
+                        isStreaming = false;
+                        stopTypingIndicator();
+                        return;
+                    }
+                    
+                    const text = decoder.decode(value, {stream: true});
+                    processStreamedData(text);
+                    
+                    return processChunk();
+                }).catch(error => {
+                    console.error('Error reading stream:', error);
+                    isStreaming = false;
+                    stopTypingIndicator();
+                });
+            }
+            
+            return processChunk();
+        }
+        
+        // Start a new chat session
+        function startNewSession() {
+            const initialMessage = document.getElementById('initialMessage').value;
+            
+            if (!initialMessage) {
+                responseElement.textContent = 'Error: Initial message is required';
+                return;
+            }
+            
+            // Reset state
+            streamBuffer = '';
+            responseMetadata = {};
+            responseElement.textContent = 'Starting new session...';
+            
+            fetch('https://fe74-122-161-52-112.ngrok-free.app/chat/start', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'text/event-stream'
+                },
+                body: JSON.stringify({
+                    message: initialMessage
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.text().then(text => {
+                        throw new Error(`Server responded with ${response.status}: ${text}`);
+                    });
+                }
+                
+                return handleStreamResponse(response);
+            })
+            .catch(error => {
+                responseElement.textContent = `Error: ${error.message}`;
+                console.error('Error:', error);
+                stopTypingIndicator();
+            });
+        }
+        
+        // Send a message in an existing chat
+        function sendMessage() {
+            const sessionId = sessionIdElement.textContent;
+            const message = document.getElementById('message').value;
+            
+            if (sessionId === 'None') {
+                responseElement.textContent = 'Error: You must start a chat first';
+                return;
+            }
+            
+            if (!message) {
+                responseElement.textContent = 'Error: Message is required';
+                return;
+            }
+            
+            // Reset state for new response
+            streamBuffer = '';
+            responseMetadata = {};
+            responseElement.textContent = '';
+            startTypingIndicator();
+            
+            // Clear the message input
+            document.getElementById('message').value = '';
+            
+            fetch('https://fe74-122-161-52-112.ngrok-free.app/chat/send', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'text/event-stream'
+                },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    message: message
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.text().then(text => {
+                        throw new Error(`Server responded with ${response.status}: ${text}`);
+                    });
+                }
+                
+                return handleStreamResponse(response);
+            })
+            .catch(error => {
+                responseElement.textContent = `Error: ${error.message}`;
+                console.error('Error:', error);
+                stopTypingIndicator();
+            });
+        }
+        
+        // Edit a message
+        function editMessage() {
+            const sessionId = sessionIdElement.textContent;
+            const messageId = document.getElementById('messageId').value;
+            const newMessage = document.getElementById('newMessage').value;
+            
+            if (sessionId === 'None') {
+                responseElement.textContent = 'Error: You must start a chat first';
+                return;
+            }
+            
+            if (!messageId) {
+                responseElement.textContent = 'Error: Message ID is required';
+                return;
+            }
+            
+            if (!newMessage) {
+                responseElement.textContent = 'Error: New message content is required';
+                return;
+            }
+            
+            responseElement.textContent = 'Editing message...';
+            
+            fetch('https://fe74-122-161-52-112.ngrok-free.app/chat/message', {
+                method: 'PATCH',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    session_id: sessionId,
+                    message_id: messageId,
+                    new_message: newMessage
+                })
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(data => {
+                        throw new Error(data.detail || `Server responded with ${response.status}`);
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                responseElement.textContent = 'Message edited successfully!\n\n' + JSON.stringify(data, null, 2);
+                
+                // Clear the message inputs
+                document.getElementById('messageId').value = '';
+                document.getElementById('newMessage').value = '';
+            })
+            .catch(error => {
+                responseElement.textContent = `Error: ${error.message}`;
+                console.error('Error:', error);
+            });
+        }
+    </script>
+</body>
+</html>

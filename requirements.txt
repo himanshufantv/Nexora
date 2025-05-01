@@ -1,0 +1,11 @@
+fastapi>=0.95.0
+uvicorn>=0.21.1
+pymongo>=4.3.3
+python-dotenv>=1.0.0
+openai>=1.0.0
+pydantic>=2.0.0
+uuid>=1.30
+asyncio>=3.4.3
+python-multipart>=0.0.5
+replicate>=1.0.6
+requests>=2.32.0 
