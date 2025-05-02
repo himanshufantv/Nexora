@@ -161,18 +161,37 @@ For each character, describe their physical appearance, age, clothing style, and
                 )
                 
                 buffer = ""
+                stop_streaming = False
                 for chunk in response:
                     if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
                         buffer += content
                         
+                        # If we already hit the JSON section, don't stream
+                        if stop_streaming:
+                            continue
+                            
+                        # Check if we're entering the JSON section
+                        if "```json" in buffer:
+                            # Send whatever is before ```json
+                            parts = buffer.split("```json", 1)
+                            if parts[0].strip():
+                                yield f"data: {parts[0]}\n\n"
+                                await asyncio.sleep(0.01)
+                            
+                            # Clear buffer and set flag to stop streaming
+                            buffer = ""
+                            stop_streaming = True
+                            continue
+                        
+                        import re
                         if re.search(r'[.!?,;:\s]', buffer) or len(buffer) > 15:
                             if buffer.strip():
                                 yield f"data: {buffer}\n\n"
                                 await asyncio.sleep(0.01)
                             buffer = ""
                 
-                if buffer.strip():
+                if buffer.strip() and not stop_streaming:
                     yield f"data: {buffer}\n\n"
         
         # Special handling for AD agent to generate scene images
@@ -442,6 +461,7 @@ Keep your description under 100 words and make it visually rich.
             
             # Direct OpenAI streaming call
             try:
+                import re
                 # Use legacy completions format for streaming simplicity
                 response = openai_client.chat.completions.create(
                     model="gpt-4",
@@ -453,6 +473,7 @@ Keep your description under 100 words and make it visually rich.
                 # Buffer to accumulate chunks for more natural word grouping
                 buffer = ""
                 full_response = ""
+                stop_streaming = False
                 
                 # Stream the response chunks
                 for chunk in response:
@@ -462,35 +483,164 @@ Keep your description under 100 words and make it visually rich.
                         buffer += content
                         full_response += content
                         
+                        # If we already hit the JSON section, just accumulate for DB but don't stream
+                        if stop_streaming:
+                            continue
+                        
+                        # Check if we're entering the JSON section (don't stream this to frontend)
+                        if "```json" in buffer:
+                            # Send whatever is before ```json
+                            parts = buffer.split("```json", 1)
+                            if parts[0].strip():
+                                yield f"data: {parts[0]}\n\n"
+                                await asyncio.sleep(0.01)
+                            
+                            # Clear buffer and set flag to stop streaming to frontend
+                            buffer = ""
+                            stop_streaming = True
+                            continue
+                        
                         # Send buffer when we have a complete word/phrase or accumulated enough text
-                        if re.search(r'[.!?,;:\s]', buffer) or len(buffer) > 15:
+                        if (re.search(r'[.!?,;:\s]', buffer) or 
+                            len(buffer) > 15 or 
+                            re.search(r'[\n\r]', buffer) or
+                            re.search(r'#+\s', buffer)):
+                            
                             if buffer.strip():
-                                yield f"data: {buffer}\n\n"
+                                # Add explicit newlines for Markdown headers and list items
+                                if re.search(r'^#+\s', buffer.strip()) or re.search(r'^-\s', buffer.strip()):
+                                    # Ensure headers start on a new line
+                                    yield f"data: \n{buffer}\n\n"
+                                else:
+                                    yield f"data: {buffer}\n\n"
                                 # Small delay to make it feel natural
                                 await asyncio.sleep(0.01)
                             buffer = ""
                 
-                # Send any remaining content in buffer
-                if buffer.strip():
+                # Send any remaining content in buffer (but not if we're in JSON section)
+                if buffer.strip() and not stop_streaming:
                     yield f"data: {buffer}\n\n"
                 
                 # Update the state with the generated content (simplified for now)
                 if full_response:
                     print(f"Full response generated: {len(full_response)} characters")
                     
-                    # Try to parse as JSON if it looks like JSON
-                    if full_response.strip().startswith('{') or full_response.strip().startswith('['):
+                    # Look for JSON data that might be enclosed in ```json ``` blocks
+                    json_data = None
+                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', full_response)
+                    
+                    if json_match:
                         try:
-                            parsed_response = json.loads(full_response)
-                            if isinstance(parsed_response, dict) and "series_title" in parsed_response:
+                            json_text = json_match.group(1).strip()
+                            print(f"Found JSON block ({len(json_text)} chars)")
+                            json_data = json.loads(json_text)
+                            print(f"Successfully parsed JSON from code block")
+                            
+                            # Process JSON data if found
+                            if isinstance(json_data, dict):
+                                if "series_title" in json_data:
+                                    state.title = json_data.get("series_title", state.title)
+                                if "logline" in json_data:
+                                    state.logline = json_data.get("logline", state.logline)
+                                if "characters" in json_data:
+                                    # Convert character objects to strings for compatibility
+                                    state.characters = [
+                                        f"{char.get('name', 'Character')}: {char.get('description', '')}"
+                                        for char in json_data.get("characters", [])
+                                    ]
+                                if "episodes" in json_data:
+                                    # Use properly structured episode data
+                                    state.episodes = [
+                                        {
+                                            "episode_title": ep.get("episode_title", f"Episode {ep.get('episode_number', i+1)}"),
+                                            "summary": ep.get("summary", "No summary available")
+                                        }
+                                        for i, ep in enumerate(json_data.get("episodes", []))
+                                    ]
+                        except json.JSONDecodeError as e:
+                            print(f"Error parsing JSON from code block: {e}")
+                            json_data = None
+                    
+                    # Only try to parse as JSON if it explicitly looks like valid JSON and we didn't already find a JSON block
+                    if not json_data and ((full_response.strip().startswith('{') and full_response.strip().endswith('}')) or (full_response.strip().startswith('[') and full_response.strip().endswith(']'))):
+                        try:
+                            json_data = json.loads(full_response)
+                            # Only process JSON if it has the expected structure
+                            if isinstance(json_data, dict) and ("series_title" in json_data or "episodes" in json_data):
                                 # Looks like a series synopsis
-                                state.title = parsed_response.get("series_title", "")
-                                state.logline = parsed_response.get("logline", "")
-                                state.characters = parsed_response.get("characters", [])
-                                state.episodes = parsed_response.get("episodes", [])
+                                state.title = json_data.get("series_title", state.title)
+                                state.logline = json_data.get("logline", state.logline)
+                                if "characters" in json_data:
+                                    state.characters = json_data.get("characters", [])
+                                if "episodes" in json_data:
+                                    state.episodes = json_data.get("episodes", [])
                         except json.JSONDecodeError:
                             # Not valid JSON, just use as raw text
-                            pass
+                            json_data = None
+                    
+                    # If using Markdown output and we couldn't parse as JSON, try to extract key information from the Markdown
+                    if not json_data and agent_to_run == "Writer" and "# " in full_response:
+                        try:
+                            # Try to extract series title (first h1 heading)
+                            title_match = re.search(r'# (.*)', full_response)
+                            if title_match:
+                                state.title = title_match.group(1).strip()
+                            
+                            # Try to extract logline (text after title, before next heading)
+                            if title_match:
+                                title_pos = title_match.start()
+                                next_heading = full_response.find('#', title_pos + 1)
+                                if next_heading > -1:
+                                    logline = full_response[title_pos + len(title_match.group(0)):next_heading].strip()
+                                    if logline:
+                                        state.logline = logline
+                            
+                            # Try to extract characters
+                            characters_section = re.search(r'## Characters(.*?)(?=^##|\Z)', full_response, re.MULTILINE | re.DOTALL)
+                            if characters_section:
+                                character_lines = re.findall(r'- (.*)', characters_section.group(1))
+                                if character_lines:
+                                    state.characters = character_lines
+                            
+                            # Try to extract episodes
+                            episodes = []
+                            episode_sections = re.finditer(r'### Episode \d+: (.*?)\n(.*?)(?=^###|\Z)', full_response, re.MULTILINE | re.DOTALL)
+                            for match in episode_sections:
+                                episode_title = match.group(1).strip()
+                                episode_summary = match.group(2).strip()
+                                episodes.append({
+                                    "episode_title": episode_title,
+                                    "summary": episode_summary
+                                })
+                            
+                            if episodes:
+                                state.episodes = episodes
+                                
+                        except Exception as parse_err:
+                            print(f"Error parsing Markdown content: {parse_err}")
+                    
+                    # Generate suggestions based on the conversation
+                    try:
+                        # Import the generate_chat_suggestions from project_api if it exists there
+                        from api.project_api import generate_chat_suggestions as get_suggestions
+                        suggestions = await get_suggestions(session_id)
+                    except (ImportError, NameError):
+                        # Fallback to hard-coded suggestions if function not available
+                        print("Couldn't import generate_chat_suggestions, using fallback suggestions")
+                        if agent_to_run == "Writer":
+                            suggestions = ["Develop the story further", "Create character backgrounds", "Add conflict"]
+                        elif agent_to_run == "Casting":
+                            suggestions = ["Cast main character", "Design character visuals", "Create character relationships"]
+                        elif agent_to_run == "Director":
+                            suggestions = ["Design a scene", "Set the visual tone", "Plan camera shots"]
+                        else:
+                            suggestions = ["Tell me more", "Create a new episode", "Add details"]
+                    
+                    # Send suggestions as a special message
+                    if suggestions:
+                        suggestions_json = json.dumps(suggestions)
+                        yield f"data: SUGGESTIONS: {suggestions_json}\n\n"
+                        await asyncio.sleep(0.05)
                     
                     # Save the updated state to the database
                     try:
@@ -559,11 +709,8 @@ Break this scene into cinematic shots:
 only 1-2 characters per shot
 Scene: {scene_text}
 
-Return format:
-[
-  {{ "shot": "...", "dialogue": "..." }},
-  ...
-]
+FORMAT YOUR RESPONSE IN MARKDOWN, not JSON.
+Use headings, bullets, and other formatting to make your response clear and readable.
 """
             else:
                 return f"Error: Scene {scene_number} does not exist in Episode {episode_number}."
@@ -589,8 +736,8 @@ only 1-2 characters per scene
 Title: {title}
 Summary: {summary}
 
-Return JSON:
-["Scene 1...", "Scene 2...", ...]
+FORMAT YOUR RESPONSE IN MARKDOWN, not JSON.
+Use headings for each scene (e.g., "## Scene 1") and include descriptions of setting, characters present, and key actions.
 """
             else:
                 return f"Error: Episode {episode_number} does not exist."
@@ -610,16 +757,65 @@ Instructions:-
 Write a 10-episode series synopsis:
 "{user_message}"
 
-Respond in this format:
+PROVIDE YOUR RESPONSE IN TWO FORMATS:
+
+FORMAT 1: PROPER, CLEAN MARKDOWN using these guidelines:
+1. Use proper line breaks between sections
+2. Start with a clear title as a level 1 heading (# Title)
+3. Put one blank line between the title and the logline
+4. Use level 2 headings (## Heading) for main sections
+5. Use bullet points with proper formatting (- Item)
+6. Use level 3 headings (### Heading) for episode titles
+7. Each section must be on its own line with proper spacing
+
+Structure your markdown response precisely as:
+
+# [Series Title]
+
+[Series Logline]
+
+## Characters
+
+- Character 1: Brief description
+- Character 2: Brief description
+
+## Episodes
+
+### Episode 1: [Title]
+
+[Episode summary]
+
+### Episode 2: [Title]
+
+[Episode summary]
+
+FORMAT 2: STRUCTURED JSON:
+After your markdown response, include a clearly formatted JSON object with the following structure:
+
+```json
 {{
-  "series_title": "...",
-  "logline": "...",
-  "characters": ["Name, description", "..."],
+  "series_title": "Title of the series",
+  "logline": "One-sentence description of the series",
+  "characters": [
+    {{"name": "Character 1", "description": "Brief description"}},
+    {{"name": "Character 2", "description": "Brief description"}}
+  ],
   "episodes": [
-    {{ "episode_title": "...", "summary": "..." }},
-    ...
+    {{
+      "episode_number": 1,
+      "episode_title": "Title of episode 1",
+      "summary": "Summary of episode 1"
+    }},
+    {{
+      "episode_number": 2,
+      "episode_title": "Title of episode 2",
+      "summary": "Summary of episode 2"
+    }}
   ]
 }}
+```
+
+Ensure your JSON is valid and properly structured. Put the JSON AFTER your markdown response.
 """
                 
     # Add prompts for other agent types here
@@ -634,6 +830,14 @@ Number of episodes: {len(state.episodes)}
 User request: {user_message}
 
 Please respond with creative content that helps develop this story further.
+FORMAT YOUR RESPONSE IN PROPER, CLEAN MARKDOWN, with:
+- Clear headings (use # for main heading, ## for subheadings)
+- Line breaks between paragraphs
+- Proper bullet points where appropriate
+- Numbered lists where sequence matters
+- Clear formatting for emphasis
+
+Ensure there are proper line breaks between sections and your response is well-structured.
 """
 
 @log_entry_exit

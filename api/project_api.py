@@ -43,61 +43,132 @@ def extract_episodes_from_response(response_text: str) -> list:
     """
     Extract episodes from the response text and return a list of episode objects
     """
+    import re
     episodes = []
     
     try:
-        # First, check if the response is valid JSON
-        if response_text.strip().startswith('{') or response_text.strip().startswith('['):
+        print(f"\n🔍 PARSING: Extracting episodes from response text ({len(response_text)} chars)")
+        
+        # First try to find and extract JSON from code blocks (new format)
+        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_text)
+        if json_match:
             try:
-                parsed_json = json.loads(response_text)
+                json_text = json_match.group(1).strip()
+                print(f"🔍 PARSING: Found JSON block in code fence ({len(json_text)} chars)")
+                parsed_json = json.loads(json_text)
                 
-                # Case 1: Response is a JSON object with an "episodes" field
                 if isinstance(parsed_json, dict) and "episodes" in parsed_json:
+                    print(f"🔍 PARSING: Extracting episodes from JSON block")
                     episodes_data = parsed_json["episodes"]
                     series_title = parsed_json.get("series_title", "Untitled Series")
                     
-                    for i, episode in enumerate(episodes_data):
+                    for ep in episodes_data:
                         episode_obj = {
-                            "episode_number": i + 1,
+                            "episode_number": ep.get("episode_number", 0),
                             "series_title": series_title,
-                            "title": episode.get("episode_title", f"Episode {i+1}"),
-                            "summary": episode.get("summary", "No summary available"),
-                            "full_data": episode
+                            "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
+                            "summary": ep.get("summary", "No summary available"),
+                            "full_data": ep
                         }
                         episodes.append(episode_obj)
+                    
+                    print(f"🔍 PARSING: Successfully extracted {len(episodes)} episodes from JSON")
+                    return episodes  # Return early if we found episodes in JSON
+            except json.JSONDecodeError as e:
+                print(f"🔍 PARSING: Error parsing JSON from code block: {e}")
+        
+        # Continue with existing methods if no episodes found in JSON blocks
+        if not episodes:
+            # Try to find JSON-like content in the text
+            json_content = None
+            json_start_indices = [response_text.find('{'), response_text.find('[')]
+            valid_starts = [idx for idx in json_start_indices if idx != -1]
+            
+            if valid_starts:
+                start_idx = min(valid_starts)
+                print(f"🔍 PARSING: Found potential JSON start at position {start_idx}")
+                json_attempt = response_text[start_idx:]
                 
-                # Case 2: Response is a JSON array of episodes
-                elif isinstance(parsed_json, list) and len(parsed_json) > 0:
-                    for i, item in enumerate(parsed_json):
-                        # Check if item looks like an episode (has title or similar fields)
-                        if isinstance(item, dict) and ("episode_title" in item or "title" in item or "summary" in item):
-                            title = item.get("episode_title") or item.get("title", f"Episode {i+1}")
+                # Try to balance braces to complete truncated JSON
+                open_braces = 0
+                open_brackets = 0
+                fixed_json = ""
+                
+                for char in json_attempt:
+                    fixed_json += char
+                    if char == '{':
+                        open_braces += 1
+                    elif char == '}':
+                        open_braces -= 1
+                    elif char == '[':
+                        open_brackets += 1
+                    elif char == ']':
+                        open_brackets -= 1
+                
+                # Complete unbalanced braces
+                while open_braces > 0:
+                    fixed_json += '}'
+                    open_braces -= 1
+                    
+                while open_brackets > 0:
+                    fixed_json += ']'
+                    open_brackets -= 1
+                    
+                # Try to fix common JSON formatting issues
+                fixed_json = fixed_json.replace("'", '"')
+                
+                # Fix missing quotes around keys
+                fixed_json = re.sub(r'([{,])\s*([a-zA-Z0-9_]+):', r'\1"\2":', fixed_json)
+                
+                try:
+                    parsed_json = json.loads(fixed_json)
+                    json_content = parsed_json
+                    print(f"🔍 PARSING: Successfully parsed JSON from raw content")
+                    
+                    # Case 1: Response is a JSON object with an "episodes" field
+                    if isinstance(json_content, dict) and "episodes" in json_content:
+                        episodes_data = json_content["episodes"]
+                        series_title = json_content.get("series_title", "Untitled Series")
+                        print(f"🔍 PARSING: Found episodes array in JSON object, count: {len(episodes_data)}")
+                        
+                        for i, episode in enumerate(episodes_data):
                             episode_obj = {
                                 "episode_number": i + 1,
-                                "series_title": "Untitled Series",
-                                "title": title,
-                                "summary": item.get("summary", "No summary available"),
-                                "full_data": item
+                                "series_title": series_title,
+                                "title": episode.get("episode_title", f"Episode {i+1}"),
+                                "summary": episode.get("summary", "No summary available"),
+                                "full_data": episode
                             }
                             episodes.append(episode_obj)
-                
-            except json.JSONDecodeError:
-                # Not valid JSON, try regex parsing
-                pass
+                        
+                        print(f"🔍 PARSING: Extracted {len(episodes)} episodes from raw JSON")
+                        return episodes
+                except json.JSONDecodeError:
+                    print(f"🔍 PARSING: Failed to parse JSON from raw content")
         
-        # If no episodes found via JSON parsing, try regex extraction
+        # Continue with regex extraction if no episodes found
         if not episodes:
+            print(f"🔍 PARSING: No episodes found in JSON formats, trying regex patterns")
             # Look for episode patterns like "Episode 1: Title" or similar
             episode_patterns = [
-                r'Episode\s+(\d+):\s*([^\n]+)(?:\n+([^#]+))?',  # Episode 1: Title followed by summary
+                r'Episode\s*(\d+):\s*"([^"]+)"([^#]*?)(?=###\s*Episode\d|$)',  # Quoted title, stopping at next episode
+                r'Episode\s*(\d+):\s*([^#\n]*?)(?=###\s*Episode\d|$)',  # Without quotes, stopping at next episode
+                r'###\s*Episode\s*(\d+):\s*([^#\n]*?)(?=###\s*Episode\d|$)',  # Markdown style with ###
+                r'Episode\s*(\d+):\s*"?([^"\n]+)"?(?:\n+([^#]+))?',  # Old pattern as fallback
                 r'(\d+)\.\s+([^\n]+)(?:\n+([^#]+))?',  # 1. Title followed by summary
                 r'"episode_title":\s*"([^"]+)".*?"summary":\s*"([^"]+)"'  # JSON-like format
             ]
             
-            for pattern in episode_patterns:
+            for i, pattern in enumerate(episode_patterns):
+                print(f"🔍 PARSING: Trying regex pattern {i+1}")
                 matches = re.finditer(pattern, response_text, re.IGNORECASE | re.MULTILINE)
+                episode_count = 0
+                match_texts = []
                 for i, match in enumerate(matches):
                     if len(match.groups()) >= 2:
+                        # Save matched text for debugging
+                        match_texts.append(match.group(0)[:50] + "..." if len(match.group(0)) > 50 else match.group(0))
+                        
                         # First group is episode number or empty, second is title, third (if exists) is summary
                         try:
                             episode_num = int(match.group(1)) if match.group(1).isdigit() else i + 1
@@ -109,10 +180,55 @@ def extract_episodes_from_response(response_text: str) -> list:
                         except (IndexError, AttributeError):
                             title = f"Episode {episode_num}"
                             
+                        # Try to split title and summary more intelligently
+                        summary = "No summary available"
                         try:
-                            summary = match.group(3).strip() if len(match.groups()) > 2 else "No summary available"
-                        except (IndexError, AttributeError):
-                            summary = "No summary available"
+                            # Common patterns for titles vs summaries:
+                            # 1. Title is first word (often capitalized with no spaces)
+                            # 2. Title might be before any spaces in the text
+                            # 3. Title is often just a few words
+                            
+                            # Approach: Find the first sentence or ending of camelCase word
+                            full_text = title
+                            
+                            # First try to find the title by looking for CamelCase or TitleCase words
+                            title_end_index = 0
+                            for i, char in enumerate(full_text):
+                                if i > 0 and char.isupper() and full_text[i-1].islower():
+                                    title_end_index = i
+                                    break
+                            
+                            # If no CamelCase pattern found, try to find first sentence
+                            if title_end_index == 0:
+                                for punct in ['.', '!', '?', ':']:
+                                    pos = full_text.find(punct)
+                                    if pos > 0:
+                                        title_end_index = pos + 1
+                                        break
+                            
+                            # If still not found, assume title is first 2-4 words (estimate)
+                            if title_end_index == 0:
+                                words = full_text.split()
+                                if len(words) > 3:  # More than 3 words
+                                    # Join first 2-3 words as title
+                                    title_end_index = len(' '.join(words[:2]))
+                                else:
+                                    # Entire content is title
+                                    title_end_index = len(full_text)
+                            
+                            # Extract title and summary
+                            if title_end_index > 0 and title_end_index < len(full_text):
+                                new_title = full_text[:title_end_index].strip()
+                                summary = full_text[title_end_index:].strip()
+                                
+                                # Only update if we found a non-empty title and summary
+                                if new_title and summary:
+                                    title = new_title
+                                    print(f"🔍 PARSING: Split title: '{title}' | Summary: '{summary[:30]}...'")
+                        except Exception as e:
+                            print(f"🔍 PARSING: Error splitting title/summary: {e}")
+                        
+                        print(f"🔍 PARSING: Found episode {episode_num}: {title}")
                         
                         episode_obj = {
                             "episode_number": episode_num,
@@ -125,13 +241,114 @@ def extract_episodes_from_response(response_text: str) -> list:
                             }
                         }
                         episodes.append(episode_obj)
+                        episode_count += 1
                 
+                print(f"🔍 PARSING: Pattern {i+1} found {episode_count} episodes")
+                if match_texts:
+                    print(f"🔍 PARSING: Sample matches: {match_texts[:2]}")
                 # If we found episodes with this pattern, no need to try other patterns
                 if episodes:
                     break
+        
+        # Special handling for markdown formatted episodes if we found some episodes but likely missed others
+        if episodes and len(episodes) < 10 and "### Episode" in response_text:
+            print(f"🔍 PARSING: Found {len(episodes)} episodes, but there may be more in markdown format")
+            # Try a specialized pattern for markdown episodes
+            markdown_pattern = r'###\s*Episode\s*(\d+):\s*([^#\n]*?)(?=###\s*Episode\d|$)'
+            matches = re.finditer(markdown_pattern, response_text, re.IGNORECASE | re.MULTILINE)
+            
+            additional_episodes = 0
+            for match in matches:
+                if len(match.groups()) >= 2:
+                    try:
+                        episode_num = int(match.group(1)) if match.group(1).isdigit() else 0
+                    except (IndexError, AttributeError):
+                        continue
+                        
+                    # Skip if we already have this episode number
+                    if any(ep["episode_number"] == episode_num for ep in episodes):
+                        continue
+                        
+                    try:
+                        title = match.group(2).strip()
+                    except (IndexError, AttributeError):
+                        title = f"Episode {episode_num}"
+                    
+                    # Try to split title and summary more intelligently
+                    summary = "No summary available"
+                    try:
+                        # Common patterns for titles vs summaries:
+                        # 1. Title is first word (often capitalized with no spaces)
+                        # 2. Title might be before any spaces in the text
+                        # 3. Title is often just a few words
+                        
+                        # Approach: Find the first sentence or ending of camelCase word
+                        full_text = title
+                        
+                        # First try to find the title by looking for CamelCase or TitleCase words
+                        title_end_index = 0
+                        for i, char in enumerate(full_text):
+                            if i > 0 and char.isupper() and full_text[i-1].islower():
+                                title_end_index = i
+                                break
+                        
+                        # If no CamelCase pattern found, try to find first sentence
+                        if title_end_index == 0:
+                            for punct in ['.', '!', '?', ':']:
+                                pos = full_text.find(punct)
+                                if pos > 0:
+                                    title_end_index = pos + 1
+                                    break
+                        
+                        # If still not found, assume title is first 2-4 words (estimate)
+                        if title_end_index == 0:
+                            words = full_text.split()
+                            if len(words) > 3:  # More than 3 words
+                                # Join first 2-3 words as title
+                                title_end_index = len(' '.join(words[:2]))
+                            else:
+                                # Entire content is title
+                                title_end_index = len(full_text)
+                        
+                        # Extract title and summary
+                        if title_end_index > 0 and title_end_index < len(full_text):
+                            new_title = full_text[:title_end_index].strip()
+                            summary = full_text[title_end_index:].strip()
+                            
+                            # Only update if we found a non-empty title and summary
+                            if new_title and summary:
+                                title = new_title
+                                print(f"🔍 PARSING: Split title: '{title}' | Summary: '{summary[:30]}...'")
+                    except Exception as e:
+                        print(f"🔍 PARSING: Error splitting title/summary: {e}")
+                    
+                    print(f"🔍 PARSING: Found additional episode {episode_num}: {title}")
+                    
+                    episode_obj = {
+                        "episode_number": episode_num,
+                        "series_title": "Extracted Series",
+                        "title": title,
+                        "summary": summary,
+                        "full_data": {
+                            "episode_title": title,
+                            "summary": summary
+                        }
+                    }
+                    episodes.append(episode_obj)
+                    additional_episodes += 1
+            
+            if additional_episodes > 0:
+                print(f"🔍 PARSING: Found {additional_episodes} additional episodes using markdown pattern")
+                
+        # Sort episodes by episode number
+        if episodes:
+            episodes.sort(key=lambda x: x["episode_number"])
+            print(f"🔍 PARSING: Final episode count: {len(episodes)}")
+            
+        print(f"🔍 PARSING: Extraction complete, found {len(episodes)} episodes")
     
     except Exception as e:
-        print(f"Error extracting episodes: {e}")
+        print(f"❌ ERROR: Error extracting episodes: {e}")
     
     return episodes
 
@@ -142,6 +359,7 @@ def determine_response_type(content: str) -> str:
     
     Returns one of: "string", "image", "video", "audio", "file", "mixed"
     """
+    import re
     # Default type
     response_type = "string"
     
@@ -205,23 +423,29 @@ async def generate_thinking_process(user_message: str) -> str:
 You are an AI assistant that explains its thinking process.
 A user has asked: "{user_message}"
 
-Write a brief 2-3 sentence explanation of how you would approach this task, including the steps you would take.
-KEEP IT BRIEF AND FOCUSED ON THE PROCESS, NOT THE ACTUAL ANSWER.
-Start your explanation with "I will..."
+Write a clear explanation of how you would approach this task, including the steps you would take.
+FORMAT YOUR RESPONSE IN VALID MARKDOWN following these guidelines:
+1. Use proper heading structure (# for main headings)
+2. Use PROPERLY FORMATTED bullet points with complete sentences
+3. Ensure all markdown syntax is valid (no incomplete bullet points, etc.)
+4. Properly format any lists with complete bullets
+5. Keep your explanation focused and structured
+
+Start your explanation with a heading "## My Approach" and organize your thoughts with properly formatted bullet points.
 """
         
         response = openai_client.chat.completions.create(
             model="gpt-3.5-turbo",  # Using a smaller, faster model for the thinking part
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=150
+            max_tokens=400
         )
         
         thinking = response.choices[0].message.content.strip()
         return thinking
     except Exception as e:
         print(f"Error generating thinking process: {e}")
-        return f"I will help you with: '{user_message}'"
+        return f"## My Approach\n\nI will help you with: '{user_message}'"
 
 # Generate chat suggestions
 async def generate_chat_suggestions(session_id: str, recent_messages: list = None) -> list:
@@ -369,17 +593,36 @@ async def start_chat(req: StartChatRequest):
 
     async def event_stream():
         # First, send the session ID so the client can capture it
+        print(f"\n🔵 API RESPONSE (/chat/start): Sending session ID: {session_id}")
         yield f"data: New session created with ID: {session_id}\n\n"
+        
+        # Stream the thinking process
+        print(f"🔵 API RESPONSE (/chat/start): Starting thinking process stream")
+        yield f"data: ThinkingProcess: begin\n\n"
+        
+        # Split the thinking process into chunks and stream them
+        # This prevents very large thinking processes from causing issues
+        chunk_size = 500  # Characters per chunk
+        for i in range(0, len(thinking_process), chunk_size):
+            chunk = thinking_process[i:i+chunk_size]
+            print(f"🔵 API RESPONSE (/chat/start): Thinking chunk: {chunk[:50]}..." if len(chunk) > 50 else f"🔵 API RESPONSE (/chat/start): Thinking chunk: {chunk}")
+            yield f"data: {chunk}\n\n"
+            # Small delay to ensure chunks are processed in order
+            await asyncio.sleep(0.01)
+            
+        print(f"🔵 API RESPONSE (/chat/start): Ending thinking process stream")
+        yield f"data: ThinkingProcess: end\n\n"
         
         # To store the complete response for database update
         full_response = []
         
         # Then stream the actual response
         async for chunk in run_producer_stream(state, session_id, req.message):
+            print(f"🔵 API RESPONSE (/chat/start): Producer stream chunk: {chunk[:50]}..." if len(chunk) > 50 else f"🔵 API RESPONSE (/chat/start): Producer stream chunk: {chunk}")
             yield chunk
             
             # Capture content for database update
-            if chunk.startswith("data: ") and "ResponseType" not in chunk and "[DONE]" not in chunk:
+            if chunk.startswith("data: ") and "ResponseType" not in chunk and "[DONE]" not in chunk and "ThinkingProcess" not in chunk and "SUGGESTIONS:" not in chunk:
                 content = chunk[6:].strip() # Remove "data: " prefix
                 if content:
                     full_response.append(content)
@@ -387,6 +630,8 @@ async def start_chat(req: StartChatRequest):
         # Save the complete response to the database
         if full_response:
             complete_text = "".join(full_response)
+            
+            print(f"\n📝 COMPLETE RESPONSE (/chat/start): First 200 chars:\n{complete_text[:200]}..." if len(complete_text) > 200 else f"\n📝 COMPLETE RESPONSE (/chat/start):\n{complete_text}")
             
             # Determine response type based on content
             response_type = determine_response_type(complete_text)
@@ -399,6 +644,13 @@ async def start_chat(req: StartChatRequest):
                     "message": complete_text
                 }]
             )
+            
+            # Send suggestions as a special message before [DONE]
+            if suggestions:
+                suggestions_json = json.dumps(suggestions)
+                print(f"🔵 API RESPONSE (/chat/start): Sending suggestions: {suggestions}")
+                yield f"data: SUGGESTIONS: {suggestions_json}\n\n"
+                await asyncio.sleep(0.05)
             
             # Extract episodes from the response
             episodes = extract_episodes_from_response(complete_text)
@@ -418,12 +670,17 @@ async def start_chat(req: StartChatRequest):
             if episodes:
                 print(f"✅ Extracted {len(episodes)} episodes")
                 nexora_response["episodes"] = episodes
+                print(f"🔵 API RESPONSE (/chat/start): Extracted episodes: {episodes}")
+            else:
+                print(f"🔵 API RESPONSE (/chat/start): No episodes extracted")
             
             # Add the message to the database
             chat_sessions.update_one(
                 {"session_id": session_id},
                 {"$push": {"messages": nexora_response}}
             )
+            
+            print(f"🔵 API RESPONSE (/chat/start): Complete response saved to database ({len(complete_text)} chars, type: {response_type})")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -474,14 +731,31 @@ async def send_chat_message(req: SendChatRequest):
         state = StoryState(**project.get("story_data"))
     
     async def event_stream():
+        # Stream the thinking process
+        print(f"\n🔵 API RESPONSE (/chat/send): Starting thinking process stream")
+        yield f"data: ThinkingProcess: begin\n\n"
+        
+        # Split the thinking process into chunks and stream them
+        chunk_size = 500  # Characters per chunk
+        for i in range(0, len(thinking_process), chunk_size):
+            chunk = thinking_process[i:i+chunk_size]
+            print(f"🔵 API RESPONSE (/chat/send): Thinking chunk: {chunk[:50]}..." if len(chunk) > 50 else f"🔵 API RESPONSE (/chat/send): Thinking chunk: {chunk}")
+            yield f"data: {chunk}\n\n"
+            # Small delay to ensure chunks are processed in order
+            await asyncio.sleep(0.01)
+            
+        print(f"🔵 API RESPONSE (/chat/send): Ending thinking process stream")
+        yield f"data: ThinkingProcess: end\n\n"
+        
         # To store the complete response for database update
         full_response = []
         
         async for chunk in run_producer_stream(state, req.session_id, req.message):
+            print(f"🔵 API RESPONSE (/chat/send): Producer stream chunk: {chunk[:50]}..." if len(chunk) > 50 else f"🔵 API RESPONSE (/chat/send): Producer stream chunk: {chunk}")
             yield chunk
             
             # Capture content for database update
-            if chunk.startswith("data: ") and "ResponseType" not in chunk and "[DONE]" not in chunk:
+            if chunk.startswith("data: ") and "ResponseType" not in chunk and "[DONE]" not in chunk and "ThinkingProcess" not in chunk and "SUGGESTIONS:" not in chunk:
                 content = chunk[6:].strip() # Remove "data: " prefix
                 if content:
                     full_response.append(content)
@@ -490,11 +764,20 @@ async def send_chat_message(req: SendChatRequest):
         if full_response:
             complete_text = "".join(full_response)
             
+            print(f"\n📝 COMPLETE RESPONSE (/chat/send): First 200 chars:\n{complete_text[:200]}..." if len(complete_text) > 200 else f"\n📝 COMPLETE RESPONSE (/chat/send):\n{complete_text}")
+            
             # Determine response type based on content
             response_type = determine_response_type(complete_text)
             
             # Generate suggestions based on the conversation
             suggestions = await generate_chat_suggestions(req.session_id)
+            
+            # Send suggestions as a special message before [DONE]
+            if suggestions:
+                suggestions_json = json.dumps(suggestions)
+                print(f"🔵 API RESPONSE (/chat/send): Sending suggestions: {suggestions}")
+                yield f"data: SUGGESTIONS: {suggestions_json}\n\n"
+                await asyncio.sleep(0.05)
             
             # Extract episodes from the response
             episodes = extract_episodes_from_response(complete_text)
@@ -514,12 +797,17 @@ async def send_chat_message(req: SendChatRequest):
             if episodes:
                 print(f"✅ Extracted {len(episodes)} episodes")
                 nexora_response["episodes"] = episodes
+                print(f"🔵 API RESPONSE (/chat/send): Extracted episodes: {episodes}")
+            else:
+                print(f"🔵 API RESPONSE (/chat/send): No episodes extracted")
             
             # Add the message to the database
             chat_sessions.update_one(
                 {"session_id": req.session_id},
                 {"$push": {"messages": nexora_response}}
             )
+            
+            print(f"🔵 API RESPONSE (/chat/send): Complete response saved to database ({len(complete_text)} chars, type: {response_type})")
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
