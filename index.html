@@ -166,6 +166,14 @@
                         responseMetadata.agentType = agentType;
                         console.log(`Response coming from: ${agentType}`);
                     }
+                    else if (data.startsWith('ThinkingProcess:')) {
+                        // Handle thinking process markers
+                        if (data === 'ThinkingProcess: begin') {
+                            responseElement.textContent = 'Thinking about your request...\n';
+                        } else if (data === 'ThinkingProcess: end') {
+                            responseElement.textContent += '\n\n';
+                        }
+                    }
                     else {
                         // Regular streaming data - append to response
                         responseElement.textContent += data;
@@ -221,7 +229,7 @@
             responseMetadata = {};
             responseElement.textContent = 'Starting new session...';
             
-            fetch('https://fe74-122-161-52-112.ngrok-free.app/chat/start', {
+            fetch('https://8ec0-122-161-48-28.ngrok-free.app/chat/start', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -271,7 +279,7 @@
             // Clear the message input
             document.getElementById('message').value = '';
             
-            fetch('https://fe74-122-161-52-112.ngrok-free.app/chat/send', {
+            fetch('https://8ec0-122-161-48-28.ngrok-free.app/chat/send', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -321,7 +329,7 @@
             
             responseElement.textContent = 'Editing message...';
             
-            fetch('https://fe74-122-161-52-112.ngrok-free.app/chat/message', {
+            fetch('https://8ec0-122-161-48-28.ngrok-free.app/chat/message', {
                 method: 'PATCH',
                 headers: {
                     'Content-Type': 'application/json'
