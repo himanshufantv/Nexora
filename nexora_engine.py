@@ -12,7 +12,7 @@ from openai import OpenAI
 from engine.runner import run_agent
 from utils.types import StoryState
 from utils.parser import safe_parse_json_string
-from utils.functional_logger import log_flow, log_api_call, log_db_operation, log_error, log_entry_exit
+from utils.functional_logger import log_api_call, log_db_operation, log_error, log_entry_exit
 
 from agents.writer import writer_agent
 from agents.director import director_agent
@@ -40,27 +40,27 @@ agent_map = {
 }
 
 async def run_producer_stream(state: StoryState, session_id: str, user_message: str):
-    log_flow(f"Starting producer stream for session {session_id}")
+    print(f"Starting producer stream for session {session_id}")
     project = projects.find_one({"session_id": session_id})
     if not project:
-        log_error(f"Session not found: {session_id}")
+        print(f"Session not found: {session_id}")
         yield "data: Error: session not found.\n\n"
         return        
-    log_flow(f"Found project for session {session_id}")
+    print(f"Found project for session {session_id}")
     
     if project.get("story_data"):
         story_data = project.get("story_data")
-        log_flow(f"Loaded story data from project")
+        print(f"Loaded story data from project")
         state = StoryState(**story_data)
         state.session_id = session_id
        
     try:
-        log_flow(f"Determining agent to run based on user message")
+        print(f"Determining agent to run based on user message")
         agent_to_run = producer_agent(state, user_message)
-        log_flow(f"Producer selected agent: {agent_to_run}")
+        print(f"Producer selected agent: {agent_to_run}")
 
         if not agent_to_run or agent_to_run not in agent_map:
-            log_flow(f"Invalid agent {agent_to_run}, defaulting to Writer")
+            print(f"Invalid agent {agent_to_run}, defaulting to Writer")
             agent_to_run = "Writer"
 
         # First send response type information
@@ -69,29 +69,29 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
         
         # If user is asking for scene images but was routed to VideoDesign, redirect to AD
         if "scene" in user_message.lower() and "image" in user_message.lower() and agent_to_run == "VideoDesign":
-            log_flow("Redirecting from VideoDesign to AD for scene images")
+            print("Redirecting from VideoDesign to AD for scene images")
             agent_to_run = "AD"
             yield f"data: ResponseType: {agent_to_run}\n\n"
             await asyncio.sleep(0.1)
             
         # Special handling for Casting agent to get images
         if agent_to_run == "Casting":
-            log_flow("Using Casting agent for image generation")
+            print("Using Casting agent for image generation")
             
             # Import the character utilities
             try:
                 from utils.character_utils import save_characters_to_db
-                log_flow("Successfully imported character_utils")
+                print(f"Successfully imported character_utils")
             except ImportError:
-                log_error("Could not import character_utils")
+                print(f"Could not import character_utils")
             
             # Use the actual Casting agent implementation
-            log_flow("Calling casting agent")
+            print("Calling casting agent")
             updated_state = casting_agent(state)
             
             # Check if we got character profiles with images
             if updated_state.character_profiles:
-                log_flow(f"Casting agent returned {len(updated_state.character_profiles)} character profiles with images")
+                print(f"Casting agent returned {len(updated_state.character_profiles)} character profiles with images")
                 
                 # Start with an introduction
                 yield "data: Character visualizations have been generated:\n\n"
@@ -103,13 +103,13 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
                     image_url = profile.get("reference_image", "")
                     description = profile.get("description", "")
                     
-                    log_flow(f"Sending character image for {char_name}")
+                    print(f"Sending character image for {char_name}")
                     # Send the image URL in a special format the client can handle
                     if image_url:
                         yield f"data: IMAGE_URL:{char_name}:{image_url}\n\n"
                         yield f"data: {char_name} has been visualized with the appearance shown above.\n\n"
                     else:
-                        log_flow(f"No image URL for character {char_name}", level="warning")
+                        print(f"WARNING: No image URL for character {char_name}")
                         yield f"data: Could not generate an image for {char_name}.\n\n"
                     
                     await asyncio.sleep(0.1)
@@ -117,16 +117,16 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
                 # Additional: Explicitly save character profiles to database
                 try:
                     if 'save_characters_to_db' in locals():
-                        log_flow("Saving character profiles to database")
+                        print(f"Saving character profiles to database")
                         log_db_operation("save", "characters", {"session_id": session_id})
                         character_save_result = save_characters_to_db(
                             session_id, 
                             updated_state.character_profiles, 
                             updated_state.character_map
                         )
-                        log_flow(f"Character save result: {character_save_result}")
+                        print(f"Character save result: {character_save_result}")
                 except Exception as char_save_err:
-                    log_error(f"Error saving characters", char_save_err)
+                    print(f"Error saving characters", char_save_err)
                 
                 # Update the state in the database (original method)
                 try:
@@ -138,12 +138,12 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
                             "updated_at": datetime.utcnow()
                         }}
                     )
-                    log_flow("Updated state in database with character images and details")
+                    print(f"Updated state in database with character images and details")
                 except Exception as db_err:
-                    log_error("Database update error", db_err)
+                    print(f"Database update error", db_err)
             else:
                 # Fallback to description generation if no images are found
-                log_flow("No character profiles with images generated, falling back to text descriptions", level="warning")
+                print(f"WARNING: No character profiles with images generated, falling back to text descriptions")
                 prompt = f"""
 You are helping visualize characters for a story.
 
@@ -188,7 +188,6 @@ For each character, describe their physical appearance, age, clothing style, and
                         if re.search(r'[.!?,;:\s]', buffer) or len(buffer) > 15:
                             if buffer.strip():
                                 yield f"data: {buffer}\n\n"
-                                await asyncio.sleep(0.01)
                             buffer = ""
                 
                 if buffer.strip() and not stop_streaming:
@@ -196,27 +195,27 @@ For each character, describe their physical appearance, age, clothing style, and
         
         # Special handling for AD agent to generate scene images
         elif agent_to_run == "AD":
-            log_flow("Using AD agent for scene image generation")
+            print(f"Using AD agent for scene image generation")
             
             # Check if we have episode scripts or scene scripts
             if not state.episode_scripts and not state.scene_scripts:
                 # If no existing scenes, create quick scene prompts from episodes
                 if state.episodes:
                     # Create scene images based on episode summaries
-                    log_flow("Generating scene visualizations from episode summaries")
+                    print(f"Generating scene visualizations from episode summaries")
                     yield "data: Generating scene visualizations from episode summaries:\n\n"
                     
                     # Import image generation function
                     from utils.replicate_image_gen import generate_flux_image
                     import replicate
-                    log_flow(f"REPLICATE_API_TOKEN is {'SET' if os.getenv('REPLICATE_API_TOKEN') else 'NOT SET'}")
+                    print(f"REPLICATE_API_TOKEN is {'SET' if os.getenv('REPLICATE_API_TOKEN') else 'NOT SET'}")
                     
                     # Generate scene prompts based on episode summaries
                     for i, episode in enumerate(state.episodes[:3]):  # Limit to first 3 episodes
                         episode_title = episode.get("episode_title", f"Episode {i+1}")
                         summary = episode.get("summary", "")
                         
-                        log_flow(f"Generating scene image for episode: {episode_title}")
+                        print(f"Generating scene image for episode: {episode_title}")
                         # Generate image prompt for this episode
                         prompt = f"""
 You are an expert visual artist creating scene descriptions for image generation.
@@ -245,7 +244,9 @@ Keep your description under 100 words and make it visually rich.
                         # Now generate a real image using Replicate API
                         try:
                             # Generate the actual image
-                            print(f"🔍 Calling generate_flux_image with scene description: {scene_description[:50]}...")
+                            print(f"========== SCENE IMAGE GENERATION: {scene_name} ==========")
+                            print(f"Scene description: {scene_description}")
+                            print(f"Calling generate_flux_image for episode summary scene")
                             image_url, _ = generate_flux_image(scene_description)
                             
                             if not image_url:
@@ -394,7 +395,9 @@ Keep your description under 100 words and make it visually rich.
                             
                             # Try to generate a real image
                             try:
-                                print(f"🔍 Calling generate_flux_image in fallback for: {scene_description[:50]}...")
+                                print(f"========== FALLBACK SCENE IMAGE GENERATION: {scene_name} ==========")
+                                print(f"Scene description: {scene_description}")
+                                print(f"Calling generate_flux_image for fallback scene")
                                 image_url, _ = generate_flux_image(scene_description)
                                 
                                 if not image_url:
@@ -500,21 +503,54 @@ Keep your description under 100 words and make it visually rich.
                             stop_streaming = True
                             continue
                         
-                        # Send buffer when we have a complete word/phrase or accumulated enough text
-                        if (re.search(r'[.!?,;:\s]', buffer) or 
-                            len(buffer) > 15 or 
-                            re.search(r'[\n\r]', buffer) or
-                            re.search(r'#+\s', buffer)):
+                        # Improved buffering - send on natural breakpoints or when buffer gets large
+                        # Preserve spaces by avoiding breaking at most spaces
+                        should_send = False
+                        
+                        # Send on sentence endings and punctuation
+                        if re.search(r'[.!?,;:]', buffer):
+                            should_send = True
+                        
+                        # Send on newlines and paragraph breaks
+                        elif re.search(r'[\n\r]', buffer):
+                            should_send = True
+                        
+                        # Send on markdown headers
+                        elif re.search(r'#+\s', buffer):
+                            should_send = True
                             
-                            if buffer.strip():
-                                # Add explicit newlines for Markdown headers and list items
-                                if re.search(r'^#+\s', buffer.strip()) or re.search(r'^-\s', buffer.strip()):
-                                    # Ensure headers start on a new line
-                                    yield f"data: \n{buffer}\n\n"
-                                else:
-                                    yield f"data: {buffer}\n\n"
-                                # Small delay to make it feel natural
-                                await asyncio.sleep(0.01)
+                        # Send on list items
+                        elif re.search(r'^-\s', buffer.strip()):
+                            should_send = True
+                            
+                        # Send if buffer is getting too large, but try to break at a good point
+                        elif len(buffer) > 80:
+                            # Try to find a good breakpoint within the last part of the buffer
+                            last_part = buffer[-20:]
+                            space_match = re.search(r'\s', last_part)
+                            
+                            if space_match:
+                                # Break at a space if we can find one in the last part
+                                break_pos = len(buffer) - 20 + space_match.start()
+                                to_send = buffer[:break_pos].strip()
+                                
+                                if to_send:
+                                    yield f"data: {to_send}\n\n"
+                                    buffer = buffer[break_pos:]
+                                    await asyncio.sleep(0.01)
+                                continue
+                            else:
+                                should_send = True
+                        
+                        if should_send and buffer.strip():
+                            # Add explicit newlines for Markdown headers and list items
+                            if re.search(r'^#+\s', buffer.strip()) or re.search(r'^-\s', buffer.strip()):
+                                # Ensure headers start on a new line
+                                yield f"data: \n{buffer}\n\n"
+                            else:
+                                yield f"data: {buffer}\n\n"
+                            # Small delay to make it feel natural
+                            await asyncio.sleep(0.01)
                             buffer = ""
                 
                 # Send any remaining content in buffer (but not if we're in JSON section)
@@ -536,27 +572,62 @@ Keep your description under 100 words and make it visually rich.
                             json_data = json.loads(json_text)
                             print(f"Successfully parsed JSON from code block")
                             
+                            # New: Print the full JSON for backend debugging
+                            print("\n====== STRUCTURED JSON DATA (FOR BACKEND DEVS) ======")
+                            print(json.dumps(json_data, indent=2))
+                            print("=====================================================\n")
+                            
                             # Process JSON data if found
                             if isinstance(json_data, dict):
+                                # Store the complete structured data directly
+                                # This is our primary source of data now
+
+                                # For series data
                                 if "series_title" in json_data:
                                     state.title = json_data.get("series_title", state.title)
                                 if "logline" in json_data:
                                     state.logline = json_data.get("logline", state.logline)
                                 if "characters" in json_data:
-                                    # Convert character objects to strings for compatibility
+                                    # Use the structured character objects directly
+                                    structured_characters = json_data.get("characters", [])
+                                    # Still convert to strings for backward compatibility
                                     state.characters = [
                                         f"{char.get('name', 'Character')}: {char.get('description', '')}"
-                                        for char in json_data.get("characters", [])
+                                        for char in structured_characters
                                     ]
+                                    # Store the original structured data as well
+                                    state.structured_characters = structured_characters
                                 if "episodes" in json_data:
-                                    # Use properly structured episode data
-                                    state.episodes = [
-                                        {
-                                            "episode_title": ep.get("episode_title", f"Episode {ep.get('episode_number', i+1)}"),
-                                            "summary": ep.get("summary", "No summary available")
-                                        }
-                                        for i, ep in enumerate(json_data.get("episodes", []))
-                                    ]
+                                    # Use properly structured episode data directly
+                                    print(f"Saving {len(json_data['episodes'])} episodes to StoryState")
+                                    state.episodes = json_data.get("episodes", [])
+                                    # Log the first episode title to verify
+                                    if len(state.episodes) > 0:
+                                        first_ep = state.episodes[0]
+                                        print(f"First episode in state: {first_ep.get('episode_title', 'No Title')}")
+                                else:
+                                    print("No episodes found in JSON data to add to StoryState")
+                                
+                                # For episode data
+                                if "episode_title" in json_data and "scenes" in json_data:
+                                    episode_num = json_data.get("episode_number", 1)
+                                    # Store the scene data in the episode_scripts
+                                    if not state.episode_scripts:
+                                        state.episode_scripts = {}
+                                    state.episode_scripts[episode_num] = json_data.get("scenes", [])
+                                
+                                # For scene data
+                                if "scene_title" in json_data and "shots" in json_data:
+                                    # Store the shot data in the scene_scripts
+                                    if not state.scene_scripts:
+                                        state.scene_scripts = {}
+                                    scene_key = json_data.get("scene_title", "scene_1")
+                                    state.scene_scripts[scene_key] = json_data.get("shots", [])
+                                
+                                # Store the complete JSON data for reference
+                                if not hasattr(state, "structured_data"):
+                                    state.structured_data = {}
+                                state.structured_data[f"response_{datetime.utcnow().isoformat()}"] = json_data
                         except json.JSONDecodeError as e:
                             print(f"Error parsing JSON from code block: {e}")
                             json_data = None
@@ -665,7 +736,7 @@ Keep your description under 100 words and make it visually rich.
     yield "data: [DONE]\n\n"
 
 def generate_agent_prompt(state: StoryState, agent_type: str, user_message: str, profile_key: str = "english_romantic") -> str:
-    log_flow(f"Generating prompt for agent type: {agent_type}")
+    print(f"Generating prompt for agent type: {agent_type}")
     
     if agent_type == "Writer":
         # Load writer profile properties
@@ -709,8 +780,38 @@ Break this scene into cinematic shots:
 only 1-2 characters per shot
 Scene: {scene_text}
 
-FORMAT YOUR RESPONSE IN MARKDOWN, not JSON.
-Use headings, bullets, and other formatting to make your response clear and readable.
+PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
+
+FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN using these guidelines:
+1. Use proper line breaks between sections
+2. Start with a clear title as a level 1 heading
+3. Use level 2 headings for shot descriptions
+4. Make your content visually clear and well-formatted
+
+FORMAT 2 (FOR STORAGE): STRUCTURED JSON
+After your markdown response, include a JSON object with all the same information in structured format:
+
+```json
+{{
+  "scene_title": "Title of the scene",
+  "shots": [
+    {{
+      "shot_number": 1,
+      "description": "Description of shot 1",
+      "dialogue": "Any dialogue in this shot",
+      "characters": ["Character1", "Character2"]
+    }},
+    {{
+      "shot_number": 2,
+      "description": "Description of shot 2",
+      "dialogue": "Any dialogue in this shot",
+      "characters": ["Character1"]
+    }}
+  ]
+}}
+```
+
+Start with the markdown content, then add the JSON at the end after all the markdown content is complete.
 """
             else:
                 return f"Error: Scene {scene_number} does not exist in Episode {episode_number}."
@@ -736,8 +837,39 @@ only 1-2 characters per scene
 Title: {title}
 Summary: {summary}
 
-FORMAT YOUR RESPONSE IN MARKDOWN, not JSON.
-Use headings for each scene (e.g., "## Scene 1") and include descriptions of setting, characters present, and key actions.
+PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
+
+FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN using these guidelines:
+1. Use proper line breaks between sections
+2. Start with a clear title as a level 1 heading
+3. Use level 2 headings for scene descriptions
+4. Make your content visually clear and well-formatted
+
+FORMAT 2 (FOR STORAGE): STRUCTURED JSON
+After your markdown response, include a JSON object with all the same information in structured format:
+
+```json
+{{
+  "episode_title": "{title}",
+  "episode_number": {episode_number},
+  "scenes": [
+    {{
+      "scene_number": 1,
+      "description": "Description of scene 1",
+      "setting": "Location of scene 1",
+      "characters": ["Character1", "Character2"]
+    }},
+    {{
+      "scene_number": 2,
+      "description": "Description of scene 2",
+      "setting": "Location of scene 2",
+      "characters": ["Character1"]
+    }}
+  ]
+}}
+```
+
+Start with the markdown content, then add the JSON at the end after all the markdown content is complete.
 """
             else:
                 return f"Error: Episode {episode_number} does not exist."
@@ -757,9 +889,9 @@ Instructions:-
 Write a 10-episode series synopsis:
 "{user_message}"
 
-PROVIDE YOUR RESPONSE IN TWO FORMATS:
+PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
 
-FORMAT 1: PROPER, CLEAN MARKDOWN using these guidelines:
+FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN using these guidelines:
 1. Use proper line breaks between sections
 2. Start with a clear title as a level 1 heading (# Title)
 3. Put one blank line between the title and the logline
@@ -789,16 +921,22 @@ Structure your markdown response precisely as:
 
 [Episode summary]
 
-FORMAT 2: STRUCTURED JSON:
-After your markdown response, include a clearly formatted JSON object with the following structure:
+FORMAT 2 (FOR STORAGE): STRUCTURED JSON
+After your markdown response, include a JSON object with all the same information:
 
 ```json
 {{
   "series_title": "Title of the series",
   "logline": "One-sentence description of the series",
   "characters": [
-    {{"name": "Character 1", "description": "Brief description"}},
-    {{"name": "Character 2", "description": "Brief description"}}
+    {{
+      "name": "Character 1", 
+      "description": "Brief description"
+    }},
+    {{
+      "name": "Character 2", 
+      "description": "Brief description"
+    }}
   ],
   "episodes": [
     {{
@@ -815,7 +953,7 @@ After your markdown response, include a clearly formatted JSON object with the f
 }}
 ```
 
-Ensure your JSON is valid and properly structured. Put the JSON AFTER your markdown response.
+Start with the markdown content for human reading, then add the JSON at the end for machine processing.
 """
                 
     # Add prompts for other agent types here
@@ -829,30 +967,46 @@ Number of episodes: {len(state.episodes)}
 
 User request: {user_message}
 
-Please respond with creative content that helps develop this story further.
-FORMAT YOUR RESPONSE IN PROPER, CLEAN MARKDOWN, with:
+PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
+
+FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN, with:
 - Clear headings (use # for main heading, ## for subheadings)
 - Line breaks between paragraphs
 - Proper bullet points where appropriate
 - Numbered lists where sequence matters
 - Clear formatting for emphasis
 
-Ensure there are proper line breaks between sections and your response is well-structured.
+FORMAT 2 (FOR STORAGE): STRUCTURED JSON
+After your markdown response, include a JSON object with your content in structured format:
+
+```json
+{{
+  "title": "Title if relevant",
+  "content_type": "What kind of content this is (feedback, idea, etc.)",
+  "main_points": [
+    "First main point",
+    "Second main point"
+  ],
+  "details": "Any additional structured data relevant to your response"
+}}
+```
+
+Start with the markdown content for display, then add the JSON at the end for data storage.
 """
 
 @log_entry_exit
 def run_engine(state: StoryState, user_message: str):
-    log_flow(f"Starting engine run with message: {user_message[:50]}...")
+    print(f"Starting engine run with message: {user_message[:50]}...")
     
     # Determine which agent to run using the producer
-    log_flow("Calling producer agent to determine next agent")
+    print("Calling producer agent to determine next agent")
     agent_to_run = producer_agent(state, user_message)
     
     if not agent_to_run or agent_to_run not in agent_map:
-        log_flow(f"Invalid agent '{agent_to_run}', defaulting to Writer")
+        print(f"Invalid agent '{agent_to_run}', defaulting to Writer")
         agent_to_run = "Writer"
     
-    log_flow(f"Producer selected agent: {agent_to_run}")
+    print(f"Producer selected agent: {agent_to_run}")
     
     # Run the selected agent
     updated_state = agent_map[agent_to_run](state)

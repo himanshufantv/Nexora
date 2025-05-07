@@ -55,23 +55,50 @@ Instructions:-
 Write a 10-episode series synopsis:
 "{user_message}"
 
-Respond in this format:
+Respond in this exact JSON format with no additional text or explanation:
+```json
 {{
-  "series_title": "...",
-  "logline": "...",
+  "series_title": "Title of the Series",
+  "logline": "One-sentence description of the series",
   "characters": ["Name, description", "..."],
   "episodes": [
-    {{ "episode_title": "...", "summary": "..." }},
-    ...
+    {{ "episode_number": 1, "episode_title": "Title of episode 1", "summary": "Detailed summary of episode 1" }},
+    {{ "episode_number": 2, "episode_title": "Title of episode 2", "summary": "Detailed summary of episode 2" }},
+    ...and so on for all 10 episodes
   ]
 }}
+```
+
+Ensure each episode has:
+1. A properly numbered episode_number field (1-10)
+2. A clear, distinct episode_title
+3. Spaces between words in titles (not camelCase or runTogether)
+4. A complete summary
 """
     response = client.chat.completions.create(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.8
     )
-    parsed = safe_parse_json_string(response.choices[0].message.content)
+    
+    content = response.choices[0].message.content
+    
+    # Extract JSON from code blocks if present
+    import re
+    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', content)
+    if json_match:
+        content_to_parse = json_match.group(1).strip()
+    else:
+        content_to_parse = content
+    
+    parsed = safe_parse_json_string(content_to_parse)
+    
+    # Ensure each episode has a proper episode_number
+    if "episodes" in parsed:
+        for i, episode in enumerate(parsed["episodes"]):
+            if "episode_number" not in episode:
+                episode["episode_number"] = i + 1
+    
     new_state = state.copy(update={
         "story_prompt": user_message,
         "title": parsed.get("series_title", ""),
@@ -82,6 +109,7 @@ Respond in this format:
     new_state.last_agent_output = parsed
     log_agent_output("Writer", new_state)
     return new_state
+
 # Level 2: Episode Breakdown
 def generate_episode_script(state, user_message, system_prompt):
     episode_number = int("".join(filter(str.isdigit, user_message)))

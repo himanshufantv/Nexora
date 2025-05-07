@@ -26,29 +26,51 @@ def detect_characters_in_text(text, character_names):
     Returns:
         list: Names of characters found in the text
     """
-    log_flow(f"Detecting characters in text from {len(character_names)} possible characters")
+    print(f"Detecting characters in text from {len(character_names)} possible characters")
     found_characters = []
     lowered_text = text.lower()
     
+    # Enhanced detection to work with various forms of character names
     for name in character_names:
         # Skip if no name
-        if not name:
+        if not name or len(name) < 2:
             continue
             
-        # Handle multi-word names (e.g., "John Smith")
+        # Convert name to lowercase for case-insensitive matching
+        name_lower = name.lower()
+        
+        # 1. Handle multi-word names (e.g., "John Smith")
         if " " in name:
-            if name.lower() in lowered_text:
+            if name_lower in lowered_text:
                 found_characters.append(name)
-                log_flow(f"Found multi-word character: {name}")
-        # Handle single-word names with word boundaries
+                print(f"Found multi-word character (exact match): {name}")
+                continue
+                
+            # Try first name / last name separately
+            name_parts = name_lower.split()
+            for part in name_parts:
+                if len(part) >= 3:  # Only match on meaningful parts (not "a", "the", etc.)
+                    pattern = rf'\b{re.escape(part)}\b'
+                    if re.search(pattern, lowered_text):
+                        found_characters.append(name)
+                        print(f"Found multi-word character (partial match on '{part}'): {name}")
+                        break
+        
+        # 2. Handle single-word names with word boundaries
         else:
-            pattern = rf'\b{re.escape(name.lower())}\b'
+            pattern = rf'\b{re.escape(name_lower)}\b'
             if re.search(pattern, lowered_text):
                 found_characters.append(name)
-                log_flow(f"Found single-word character: {name}")
+                print(f"Found single-word character: {name}")
+                
+    # Remove duplicates while preserving order
+    unique_found = []
+    for char in found_characters:
+        if char not in unique_found:
+            unique_found.append(char)
     
-    log_flow(f"Detected {len(found_characters)} characters: {', '.join(found_characters) if found_characters else 'none'}")
-    return found_characters
+    print(f"Detected {len(unique_found)} characters: {', '.join(unique_found) if unique_found else 'none'}")
+    return unique_found
 
 @log_entry_exit
 def select_best_lora(character_profiles, detected_characters):
@@ -377,11 +399,27 @@ Respond ONLY with the image prompt.
 
                 # Set seed: reuse same seed within the scene
                 if scene_seed is None:
-                    print(f"🔍 Calling generate_flux_image with prompt: {image_prompt[:50]}...")
+                    print(f"========== CHARACTER SCENE IMAGE GENERATION ==========")
+                    print(f"Shot key: {unique_key}")
+                    print(f"Image prompt: {image_prompt}")
+                    print(f"Characters in shot: {detected_chars}")
+                    print(f"LoRA type: {lora_type}")
+                    print(f"LoRA value: {lora_to_use}")
+                    print(f"Character pair: {char_pair}")
+                    print(f"Generating first image in scene (seed will be auto-generated)")
                     image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
                     if used_seed is not None:
                         scene_seed = used_seed
+                        print(f"Generated seed {scene_seed} will be used for subsequent shots in this scene")
                 else:
+                    print(f"========== CHARACTER SCENE IMAGE GENERATION ==========")
+                    print(f"Shot key: {unique_key}")
+                    print(f"Image prompt: {image_prompt}")
+                    print(f"Characters in shot: {detected_chars}")
+                    print(f"LoRA type: {lora_type}")
+                    print(f"LoRA value: {lora_to_use}")
+                    print(f"Character pair: {char_pair}")
+                    print(f"Reusing scene seed: {scene_seed}")
                     image_url, _ = generate_flux_image(image_prompt, hf_lora=lora_to_use, seed=scene_seed)
 
                 if not image_url:
@@ -395,16 +433,51 @@ Respond ONLY with the image prompt.
     if not ad_images and state.episodes:
         print("📝 Generating episode-based scene images")
         
+        # Track seeds for episodes to maintain visual consistency across related images
+        episode_seeds = {}  # {episode_num: seed}
+        
         for i, episode in enumerate(state.episodes[:3]):  # Limit to first 3 episodes
             episode_title = episode.get("episode_title", f"Episode {i+1}")
             summary = episode.get("summary", "")
             
             # Detect characters in the episode summary
+            print(f"\n========== CHARACTER DETECTION FOR EPISODE {i+1} ==========")
+            print(f"Episode title: {episode_title}")
+            print(f"Episode summary: {summary}")
+            print(f"Available character names: {character_names}")
+            
             detected_chars = detect_characters_in_text(summary, character_names)
             print(f"🧠 Episode {i+1}: Detected characters: {detected_chars}")
             
+            # If no characters detected, try to extract character names directly
+            if not detected_chars and finalized_characters:
+                print("No characters detected by name matching - trying direct extraction")
+                # Use the first 1-2 characters as a fallback
+                detected_chars = [finalized_characters[0]['name']]
+                if len(finalized_characters) > 1:
+                    detected_chars.append(finalized_characters[1]['name'])
+                print(f"Using fallback characters: {detected_chars}")
+            
             # Select best LoRA for this episode
+            print(f"Character profiles available: {len(finalized_characters)}")
+            for idx, char in enumerate(finalized_characters):
+                print(f"  {idx+1}. {char.get('name')}: LoRA = {char.get('hf_lora', 'None')}, combined = {char.get('combined_lora', 'None')}")
+                
             lora_type, lora_to_use, char_pair = select_best_lora(finalized_characters, detected_chars)
+            
+            # Debug LoRA selection
+            print(f"LoRA selection result - Type: {lora_type}, Value: {lora_to_use}, Pair: {char_pair}")
+            
+            # Ensure we have a valid LoRA to use
+            if not lora_to_use and finalized_characters:
+                # Force use of first character's LoRA as fallback
+                for char in finalized_characters:
+                    if char.get('hf_lora'):
+                        lora_to_use = char.get('hf_lora')
+                        lora_type = "individual"
+                        char_pair = [char.get('name')]
+                        print(f"No LoRA selected - forcing use of {char.get('name')}'s LoRA: {lora_to_use}")
+                        break
             
             # Generate image prompt for this episode
             prompt_to_gpt = f"""
@@ -441,6 +514,7 @@ Keep your description under 100 words and make it visually rich.
                 "character_pair": char_pair
             }
             
+            # Print lora info
             print(f"🔍 Calling generate_flux_image with scene description: {scene_description[:50]}...")
             print(f"   Using {lora_type} LoRA: {lora_to_use}")
             
@@ -450,29 +524,67 @@ Keep your description under 100 words and make it visually rich.
                 import replicate
                 
                 # First try standard flux image generation
-                image_url, _ = generate_flux_image(scene_description, hf_lora=lora_to_use)
+                print(f"========== EPISODE IMAGE GENERATION ==========")
+                print(f"Episode: {episode_title}")
+                print(f"Scene description: {scene_description}")
+                print(f"Characters: {detected_chars}")
+                print(f"LoRA type: {lora_type}")
+                print(f"LoRA value: {lora_to_use}")
+                print(f"Character pair: {char_pair}")
+                
+                # Check if we should use a consistent seed for this episode
+                if i in episode_seeds:
+                    seed_value = episode_seeds[i]
+                    print(f"Using consistent seed {seed_value} for episode {i+1}")
+                    image_url, _ = generate_flux_image(scene_description, hf_lora=lora_to_use, seed=seed_value)
+                else:
+                    print(f"Generating first image for episode {i+1} - seed will be auto-generated")
+                    image_url, used_seed = generate_flux_image(scene_description, hf_lora=lora_to_use)
+                    # Save seed for consistency if one was returned
+                    if used_seed is not None:
+                        episode_seeds[i] = used_seed
+                        print(f"Saving seed {used_seed} for episode {i+1} consistency")
                 
                 if not image_url:
                     # Fallback to manual direct call
                     print("⚠️ Primary image generation failed, trying direct call...")
+                    print(f"========== FALLBACK EPISODE IMAGE GENERATION ==========")
+                    print(f"Episode: {episode_title}")
+                    print(f"Scene description: {scene_description}")
+                    print(f"Note: Direct fallback doesn't support LoRA")
+                    
+                    fallback_input = {
+                        "prompt": scene_description,
+                        "aspect_ratio": "9:16",
+                        "output_format": "jpg",
+                        "prompt_strength": 0.8
+                    }
+                    
+                    # Use the same seed if we have one for consistency
+                    if i in episode_seeds:
+                        seed_value = episode_seeds[i]
+                        fallback_input["seed"] = seed_value
+                        print(f"Using consistent seed {seed_value} in fallback")
+                        
+                    print(f"Fallback input: {fallback_input}")
                     output = replicate.run(
                         "black-forest-labs/flux-1.1-pro",
-                        input={
-                            "prompt": scene_description,
-                            "aspect_ratio": "9:16",
-                            "output_format": "jpg",
-                            "prompt_strength": 0.8
-                        }
+                        input=fallback_input
                     )
+                    
+                    print(f"Fallback output: {output}")
                     
                     if isinstance(output, list) and len(output) > 0:
                         image_url = str(output[0])
+                        print(f"Using first image from fallback: {image_url}")
                     elif isinstance(output, str):
                         image_url = output
+                        print(f"Using string output from fallback: {image_url}")
             except Exception as e:
                 print(f"❌ All image generation attempts failed: {e}")
                 # Final fallback to placeholder
                 image_url = f"https://placehold.co/600x400/png?text={episode_title.replace(' ', '+')}"
+                print(f"Using placeholder image due to all failures: {image_url}")
             
             if not image_url:
                 print(f"❌ Failed to generate image for {scene_key}.")
