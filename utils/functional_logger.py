@@ -22,82 +22,78 @@ logging.basicConfig(
 flow_logger = logging.getLogger("nexora_flow")
 
 def log_entry_exit(func):
-    """Decorator to log function entry and exit"""
+    """Decorator to print function entry and exit"""
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         caller = inspect.currentframe().f_back
         filename = caller.f_code.co_filename.split("/")[-1] if caller else "unknown"
         lineno = caller.f_lineno if caller else 0
         
-        flow_logger.info(f"➡️ ENTER: {func.__name__} in {filename}:{lineno}")
+        print(f"ENTER: {func.__name__} in {filename}")
         
         try:
             result = func(*args, **kwargs)
-            flow_logger.info(f"⬅️ EXIT: {func.__name__} in {filename}")
+            print(f"EXIT: {func.__name__} in {filename}")
             return result
         except Exception as e:
-            flow_logger.error(f"❌ ERROR in {func.__name__}: {str(e)}")
-            flow_logger.debug(traceback.format_exc())
+            print(f"ERROR in {func.__name__}: {str(e)}")
+            # Uncomment for debugging
+            # print(traceback.format_exc())
             raise
             
     return wrapper
 
 def log_flow(message, level="info"):
-    """Log a flow message with caller information"""
-    frame = inspect.currentframe().f_back
-    filename = frame.f_code.co_filename.split("/")[-1]
-    lineno = frame.f_lineno
-    caller = frame.f_code.co_name
-    
-    log_message = f"🔄 FLOW: {message} in {filename}:{lineno} ({caller})"
-    
-    if level.lower() == "debug":
-        flow_logger.debug(log_message)
-    elif level.lower() == "warning":
-        flow_logger.warning(log_message)
+    """
+    Previously: Log a flow message with caller information
+    Now: Print a flow message with basic information
+    """
+    # Simple implementation that just uses print
+    if level.lower() == "warning":
+        print(f"WARNING: {message}")
     elif level.lower() == "error":
-        flow_logger.error(log_message)
+        print(f"ERROR: {message}")
+    elif level.lower() == "debug":
+        print(f"DEBUG: {message}")
     else:
-        flow_logger.info(log_message)
+        print(f"{message}")
 
 def log_api_call(api_name, params=None):
-    """Log an API call with parameters"""
-    frame = inspect.currentframe().f_back
-    filename = frame.f_code.co_filename.split("/")[-1]
-    lineno = frame.f_lineno
-    
+    """
+    Previously: Log an API call with parameters
+    Now: Print an API call with parameters
+    """
     param_str = f" with params: {params}" if params else ""
-    flow_logger.info(f"🔌 API: Calling {api_name}{param_str} in {filename}:{lineno}")
+    print(f"API CALL: {api_name}{param_str}")
 
 def log_db_operation(operation, collection, query=None):
-    """Log a database operation"""
-    frame = inspect.currentframe().f_back
-    filename = frame.f_code.co_filename.split("/")[-1]
-    lineno = frame.f_lineno
-    
+    """
+    Previously: Log a database operation
+    Now: Print a database operation
+    """
     query_str = f" with query: {query}" if query else ""
-    flow_logger.info(f"💾 DB: {operation} on {collection}{query_str} in {filename}:{lineno}")
+    print(f"DB {operation}: {collection}{query_str}")
 
 def log_state_update(state_key, value=None):
-    """Log a state update"""
-    frame = inspect.currentframe().f_back
-    filename = frame.f_code.co_filename.split("/")[-1]
-    lineno = frame.f_lineno
-    
+    """
+    Previously: Log a state update
+    Now: Print a state update
+    """
     value_str = f": {value}" if value is not None else ""
-    flow_logger.info(f"🔄 STATE: Updated {state_key}{value_str} in {filename}:{lineno}")
+    print(f"STATE UPDATE: {state_key}{value_str}")
 
 def log_error(error_message, exception=None):
-    """Log an error with stack trace"""
-    frame = inspect.currentframe().f_back
-    filename = frame.f_code.co_filename.split("/")[-1]
-    lineno = frame.f_lineno
-    
-    flow_logger.error(f"❌ ERROR: {error_message} in {filename}:{lineno}")
+    """
+    Previously: Log an error with stack trace
+    Now: Print an error message with optional exception info
+    """
+    print(f"ERROR: {error_message}")
     
     if exception:
-        flow_logger.debug(traceback.format_exc())
-        
+        print(f"Exception: {str(exception)}")
+        # If detailed debugging is needed, uncomment this line
+        # print(traceback.format_exc())
+
 """
 #-----------------------------------------#
 # HOW TO USE THE FUNCTIONAL LOGGER        #

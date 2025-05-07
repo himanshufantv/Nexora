@@ -25,6 +25,7 @@ class StoryState(BaseModel):
     characters: List[str] = []                     # Raw character lines
     character_map: Dict[str, str] = {}             # "John Harrow" → "character-1"
     character_profiles: List[Dict[str, Any]] = []  # [{name, description, image_url, seed}]
+    structured_characters: List[Dict[str, Any]] = []  # Direct JSON character data
 
     # Series Structure
     script_outline: str = ""
@@ -40,3 +41,6 @@ class StoryState(BaseModel):
     scene_image_prompts: List[str] = []            # Flux image URLs
     video_clips: List[str] = []           
     session_id: str = ""         # Kling video URLs
+    
+    # Structured Data Storage (from JSON responses)
+    structured_data: Dict[str, Any] = {}  # Stores complete JSON data from responses
