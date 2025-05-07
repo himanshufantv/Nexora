@@ -632,7 +632,7 @@ async def send_chat_message(req: SendChatRequest):
     
     if prompt:
         print(f"Processing prompt: {prompt[:50]}..." if len(prompt) > 50 else f"Processing prompt: {prompt}")
-    
+        
         # Store the user message only if it's a new prompt (not the initial one being reused)
         if prompt != initial_prompt:
             user_message = {
@@ -656,8 +656,8 @@ async def send_chat_message(req: SendChatRequest):
                     "message": user_message["message"]
                 }
             })
-    else:
-        print(f"No prompt provided and not first call, will only return existing data")
+        else:
+            print(f"No prompt provided and not first call, will only return existing data")
     
     # Create state object for processing
     print(f"Creating StoryState object")
@@ -674,13 +674,13 @@ async def send_chat_message(req: SendChatRequest):
         print(f"No story data found for this session or empty data")
     
     async def event_stream():
+        nonlocal project, complete_text  # Make these variables accessible inside event_stream
         print(f"Starting event stream for response")
         # To store the complete response for database update
         full_response = []
         suggestions = []
         episodes = []
         script_char_names = []  # Initialize this variable
-        complete_text = ""  # Initialize complete_text for cases with no prompt
         
         # Start streaming structured response - first send prompt
         initial_response = {
@@ -815,33 +815,64 @@ async def send_chat_message(req: SendChatRequest):
             # Extract episodes if present in the response
             print(f"Checking for episodes in response")
             try:
-                # Check for JSON data in the response
-                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', complete_text)
-                if json_match:
-                    print(f"Found JSON data in markdown code block")
-                    json_text = json_match.group(1).strip()
-                    print(f"Parsing JSON data ({len(json_text)} chars)")
-                    json_data = json.loads(json_text)
+                # First try to extract episodes using markdown section headers
+                episode_sections = re.findall(r'###\s*Episode\s*\d+[:\s]+(.*?)(?=###|$)', complete_text, re.DOTALL | re.IGNORECASE)
+                if episode_sections:
+                    print(f"Found {len(episode_sections)} episode sections using markdown headers")
+                    series_title = re.search(r'#\s*(.*?)(?=##|\n|$)', complete_text)
+                    series_title = series_title.group(1).strip() if series_title else "Untitled Series"
                     
-                    if isinstance(json_data, dict) and "episodes" in json_data:
-                        print(f"Found episodes key in JSON data with {len(json_data['episodes'])} episodes")
-                        raw_episodes = json_data.get("episodes", [])
-                        series_title = json_data.get("series_title", "Untitled Series")
+                    for i, section in enumerate(episode_sections, 1):
+                        # Clean up the section text
+                        section = section.strip()
+                        # Try to extract title and summary
+                        title_match = re.search(r'^([^.\n]+)', section)
+                        title = title_match.group(1).strip() if title_match else f"Episode {i}"
+                        summary = section.replace(title, '').strip(' :\n.')
                         
-                        print(f"Processing episodes from JSON data")
-                        for ep in raw_episodes:
-                            episode_obj = {
-                                "episode_number": ep.get("episode_number", 0),
-                                "series_title": series_title,
-                                "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
-                                "summary": ep.get("summary", "No summary available"),
-                                "full_data": ep
+                        episode_obj = {
+                            "episode_number": i,
+                            "series_title": series_title,
+                            "title": title,
+                            "summary": summary,
+                            "full_data": {
+                                "episode_number": i,
+                                "episode_title": title,
+                                "summary": summary
                             }
-                            episodes.append(episode_obj)
-                        print(f"Processed {len(episodes)} episodes from JSON data")
-                else:
-                    print(f"No JSON data found in response, checking story state for episodes")
-                    # Try to get episodes from the state
+                        }
+                        episodes.append(episode_obj)
+                    print(f"Processed {len(episodes)} episodes from markdown sections")
+                
+                # If no episodes found from markdown, try JSON format
+                if not episodes:
+                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', complete_text)
+                    if json_match:
+                        print(f"Found JSON data in markdown code block")
+                        json_text = json_match.group(1).strip()
+                        print(f"Parsing JSON data ({len(json_text)} chars)")
+                        json_data = json.loads(json_text)
+                        
+                        if isinstance(json_data, dict) and "episodes" in json_data:
+                            print(f"Found episodes key in JSON data with {len(json_data['episodes'])} episodes")
+                            raw_episodes = json_data.get("episodes", [])
+                            series_title = json_data.get("series_title", "Untitled Series")
+                            
+                            print(f"Processing episodes from JSON data")
+                            for ep in raw_episodes:
+                                episode_obj = {
+                                    "episode_number": ep.get("episode_number", 0),
+                                    "series_title": series_title,
+                                    "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
+                                    "summary": ep.get("summary", "No summary available"),
+                                    "full_data": ep
+                                }
+                                episodes.append(episode_obj)
+                            print(f"Processed {len(episodes)} episodes from JSON data")
+                
+                # If still no episodes found, check story state
+                if not episodes:
+                    print(f"No episodes found in response, checking story state")
                     if project and project.get("story_data") and "episodes" in project.get("story_data", {}):
                         print(f"Found episodes in story data")
                         state_episodes = project["story_data"].get("episodes", [])
@@ -867,9 +898,42 @@ async def send_chat_message(req: SendChatRequest):
             
             # Create response message
             print(f"Creating nexora response message for database")
+            
+            # Generate structured JSON data for database storage
+            if complete_text:
+                print(f"Generating structured JSON data for database")
+                structured_data = await generate_structured_story_data(complete_text)
+                if structured_data:
+                    print(f"Successfully generated structured data")
+                    episodes = []
+                    if "episodes" in structured_data:
+                        for ep in structured_data["episodes"]:
+                            episode_obj = {
+                                "episode_number": ep.get("episode_number", 0),
+                                "series_title": structured_data.get("series_title", "Untitled Series"),
+                                "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
+                                "summary": ep.get("summary", "No summary available"),
+                                "full_data": ep
+                            }
+                            episodes.append(episode_obj)
+                        print(f"Processed {len(episodes)} episodes from structured data")
+                        
+                        # Update story data in the database
+                        if project:
+                            update_data = {
+                                "story_data.episodes": structured_data["episodes"],
+                                "story_data.series_title": structured_data.get("series_title", "Untitled Series")
+                            }
+                            story_projects.update_one(
+                                {"session_id": req.session_id},
+                                {"$set": update_data}
+                            )
+                            print(f"Updated story data in database with structured data")
+            
             nexora_response = {
                 "sender": "nexora",
-                "message": thinking_process,  # Use thinking as message
+                "message": complete_text if complete_text else thinking_process,  # Keep markdown for frontend
+                "thinking_process": thinking_process,
                 "timestamp": datetime.utcnow(),
                 "suggestions": suggestions,
                 "response_type": response_type,
@@ -882,6 +946,11 @@ async def send_chat_message(req: SendChatRequest):
             if episodes:
                 print(f"Adding {len(episodes)} episodes to response")
                 nexora_response["episodes"] = episodes
+            
+            # Add script if available
+            if complete_text:
+                print(f"Adding script content to response")
+                nexora_response["script"] = complete_text
             
             # Add the message to the database
             print(f"Storing nexora response in database")
@@ -896,7 +965,7 @@ async def send_chat_message(req: SendChatRequest):
             chat_history.append({
                 "receiver": {
                     "time": str(nexora_response["timestamp"]),
-                    "message": nexora_response["message"]  # Use message field instead of thinking
+                    "message": nexora_response["message"]  # Use the complete message
                 }
             })
             print(f"Chat history updated, now has {len(chat_history)} entries")
@@ -911,103 +980,34 @@ async def send_chat_message(req: SendChatRequest):
         character_images = []
         
         try:
-            # First check if we need to extract characters from the script
-            if complete_text and len(complete_text) > 50:
-                print(f"Extracting character names from script for matching")
-                script_char_names = await extract_character_names(complete_text)
-                print(f"Extracted {len(script_char_names)} character names from script")
-            # If no new script content but we have existing script characters
-            elif project and "story_data" in project and "script_characters" in project["story_data"]:
-                script_char_names = project["story_data"].get("script_characters", [])
-                print(f"Using {len(script_char_names)} existing script characters from database")
-            else:
-                script_char_names = []
-                print(f"No script content or existing script characters available")
+            # Fetch latest project data to ensure we have the most recent character profiles
+            project = story_projects.find_one({"session_id": req.session_id})
             
-            # Always check for character profiles in the database first
-            if project and project.get("story_data"):
-                # First check if we have character_profiles in the story_data
-                story_data = project.get("story_data", {})
+            if project and "story_data" in project and "character_profiles" in project["story_data"]:
+                character_profiles = project["story_data"]["character_profiles"]
+                print(f"Found {len(character_profiles)} character profiles in database")
                 
-                if "character_profiles" in story_data:
-                    print(f"Found character profiles in story data")
-                    characters = story_data["character_profiles"]
-                    print(f"Processing {len(characters)} character profiles")
-                    
-                    # Always include ALL character profiles from database, even without images
-                    for char in characters:
-                        if "name" in char:
-                            name = char.get("name", "Unknown Character")
-                            image_url = char.get("reference_image", "")
-                            print(f"Adding character: {name}, Has image: {bool(image_url)}")
-                            
-                            character_images.append({
-                                "name": name,
-                                "db_name": name,
-                                "image_url": image_url,
-                                "description": char.get("description", "No description available")
-                            })
-                    
-                    print(f"Added {len(character_images)} character profiles directly from database")
-                
-                # If still no characters from profiles but we have matched_characters
-                if not character_images and "matched_characters" in story_data:
-                    print(f"Using previously matched characters from database")
-                    db_matched_chars = story_data.get("matched_characters", [])
-                    
-                    for char in db_matched_chars:
+                for profile in character_profiles:
+                    if isinstance(profile, dict) and "name" in profile:  # Ensure profile is valid
                         character_images.append({
-                            "name": char.get("script_name", "Unknown Character"),
-                            "db_name": char.get("db_name", "Unknown Character"),
-                            "image_url": char.get("image_url", ""),
-                            "description": char.get("description", "")
+                            "name": profile.get("name", "Unknown Character"),
+                            "image_url": profile.get("reference_image", ""),
+                            "description": profile.get("description", "No description available")
                         })
-                    print(f"Added {len(character_images)} previously matched character images from database")
-                
-                # Fall back to script_char_names if still no characters found
-                if not character_images and script_char_names:
-                    print(f"Creating placeholder characters for script characters")
-                    for char_name in script_char_names:
-                        character_images.append({
-                            "name": char_name,
-                            "db_name": char_name,
-                            "image_url": "",
-                            "description": "Character from the script."
-                        })
-                    print(f"Added {len(character_images)} character placeholders")
+                        print(f"Added character: {profile.get('name')}")
+            else:
+                print(f"No character profiles found in database")
+                character_images = []
         except Exception as e:
-            print(f"ERROR fetching character images: {str(e)}")
+            print(f"ERROR fetching character profiles: {str(e)}")
             import traceback
             print(traceback.format_exc())
-        
-        # Final check: directly access character_profiles from the database
-        if project and project.get("story_data") and "character_profiles" in project.get("story_data", {}):
-            print(f"FINAL CHECK: Directly accessing character_profiles from database")
-            db_characters = project["story_data"]["character_profiles"]
-            print(f"Found {len(db_characters)} character profiles in database")
-            
-            # Clear existing character images to avoid duplicates
             character_images = []
-            
-            for char in db_characters:
-                if "name" in char:
-                    name = char.get("name", "Unknown Character")
-                    image_url = char.get("reference_image", "")
-                    print(f"Adding character directly from DB: {name}, Has image: {bool(image_url)}")
-                    
-                    character_images.append({
-                        "name": name,
-                        "db_name": name,
-                        "image_url": image_url,
-                        "description": char.get("description", "No description available")
-                    })
-            
-            print(f"Added {len(character_images)} characters directly from database")
         
-        # Final debug check for character images
+        # Debug output
         print(f"DEBUG: Final character count before response: {len(character_images)}")
         for idx, char in enumerate(character_images):
-            print(f"DEBUG: Character {idx+1}: {char.get('name')}, Has image: {bool(char.get('image_url'))}")
+            print(f"DEBUG: Character {idx+1}: {char.get('name')}, Image: {bool(char.get('image_url'))}")
         
         # Construct the final response object
         print(f"Constructing final response object")
@@ -1046,13 +1046,13 @@ async def send_chat_message(req: SendChatRequest):
                 print(f"No synopsis found in story_data")
                 synopsis_content = "Synopsis will be generated after more content is available."
         
-        # Final response object with everything
-        response_obj = {
+        # Prepare the final response
+        response = {
             "prompt": prompt,
-            "left_section": chat_history,  # Full chat history including the new message
+            "left_section": chat_history,
             "tabs": suggestions,
-            "synopsis": synopsis_content,  # Use the generated or retrieved synopsis
-            "script": complete_text,       # Keep the full script separate
+            "synopsis": synopsis_content,
+            "script": complete_text,
             "character": character_images,
             "storyboard": None
         }
@@ -1060,7 +1060,7 @@ async def send_chat_message(req: SendChatRequest):
         
         # Send the final JSON response
         print(f"Serializing response object to JSON")
-        response_json = json.dumps(response_obj)
+        response_json = json.dumps(response)
         print(f"Response JSON created ({len(response_json)} chars)")
         
         # Print the full response JSON for debugging
@@ -1115,3 +1115,51 @@ async def edit_message(req: EditMessageRequest):
         "message": "Message updated successfully",
         "updated_message": updated_message
     }
+
+async def generate_structured_story_data(markdown_text: str) -> dict:
+    """Generate structured JSON story data from markdown text using GPT"""
+    try:
+        prompt = f"""
+Convert this story markdown into a structured JSON format.
+Extract the series title, episodes, and any character information.
+
+MARKDOWN TEXT:
+{markdown_text}
+
+Return ONLY valid JSON in this exact format (no explanation needed):
+{{
+    "series_title": "The title of the series",
+    "episodes": [
+        {{
+            "episode_number": 1,
+            "episode_title": "Title of episode 1",
+            "summary": "Summary of episode 1"
+        }},
+        // ... more episodes
+    ]
+}}
+"""
+        
+        print(f"Requesting GPT to structure story data")
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=2000
+        )
+        
+        structured_data = response.choices[0].message.content.strip()
+        print(f"Received structured data from GPT")
+        
+        # Parse the response to ensure it's valid JSON
+        try:
+            json_data = json.loads(structured_data)
+            print(f"Successfully parsed structured data with {len(json_data.get('episodes', []))} episodes")
+            return json_data
+        except json.JSONDecodeError as e:
+            print(f"Error parsing GPT response as JSON: {e}")
+            return None
+            
+    except Exception as e:
+        print(f"Error generating structured data: {e}")
+        return None
