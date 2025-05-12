@@ -43,6 +43,9 @@ def generate_flux_image(prompt: str, hf_lora: str = "", aspect_ratio="9:16", see
     if seed is not None:
         print(f"Adding seed to request: {seed}")
         input_data["seed"] = int(seed)
+        used_seed = seed  # Track the seed we're using
+    else:
+        used_seed = None  # Will be updated if we can extract it from response
 
     print(f"FULL INPUT PAYLOAD: {input_data}")
     
@@ -55,6 +58,11 @@ def generate_flux_image(prompt: str, hf_lora: str = "", aspect_ratio="9:16", see
                 input=input_data
             )
             print(f"Received response from flux-dev-lora: {output}")
+            
+            # Try to extract the seed that was actually used (if available in metadata)
+            if isinstance(output, dict) and "metadata" in output and "seed" in output["metadata"]:
+                used_seed = output["metadata"]["seed"]
+                print(f"Extracted used seed from metadata: {used_seed}")
         except Exception as e:
             print(f"Error with Flux-dev-lora model: {str(e)}")
             print(f"Trying fallback model")
@@ -68,6 +76,7 @@ def generate_flux_image(prompt: str, hf_lora: str = "", aspect_ratio="9:16", see
             if seed is not None:
                 fallback_input["seed"] = int(seed)
                 print(f"Adding seed to fallback request: {seed}")
+                used_seed = seed  # Track the seed we're using
             
             if hf_lora and hf_lora.strip():
                 print(f"WARNING: LoRA parameter not supported in fallback model, ignoring: {hf_lora}")
@@ -79,16 +88,23 @@ def generate_flux_image(prompt: str, hf_lora: str = "", aspect_ratio="9:16", see
                 input=fallback_input
             )
             print(f"Received response from flux-1.1-pro: {output}")
+            
+            # Try to extract seed from metadata in fallback response
+            if isinstance(output, dict) and "metadata" in output and "seed" in output["metadata"]:
+                used_seed = output["metadata"]["seed"]
+                print(f"Extracted used seed from fallback metadata: {used_seed}")
 
         # Output is list of image URLs
         if isinstance(output, list) and len(output) > 0:
             print(f"SUCCESS: Generated image URL: {output[0]}")
+            print(f"SEED USED: {used_seed}")
             print(f"======================= IMAGE GENERATION COMPLETE =======================")
-            return str(output[0]), seed
+            return str(output[0]), used_seed
         elif isinstance(output, str):
             print(f"SUCCESS: Generated image URL: {output}")
+            print(f"SEED USED: {used_seed}")
             print(f"======================= IMAGE GENERATION COMPLETE =======================")
-            return str(output), seed
+            return str(output), used_seed
         else:
             print(f"ERROR: Invalid output format from Replicate: {output}")
             print(f"======================= IMAGE GENERATION FAILED =======================")
