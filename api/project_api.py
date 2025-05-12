@@ -1,5 +1,4 @@
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from pymongo import MongoClient
 from datetime import datetime
@@ -7,15 +6,21 @@ from dotenv import load_dotenv
 from utils.types import StoryState
 from engine.runner import run_agent
 from openai import OpenAI
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import os
 import uuid
-import asyncio
 import json
 import re
 
 from nexora_engine import run_producer_stream
+from agents.producer import producer_agent
+from agents.writer import writer_agent
+from agents.casting import casting_agent
+from agents.ad import ad_agent
+from agents.director import director_agent
+from agents.video_design import video_design_agent
+from agents.editor import editor_agent
 
 load_dotenv()
 
@@ -26,6 +31,16 @@ db = client["StudioNexora"]
 story_projects = db["story_projects"]
 chat_sessions = db["chat_sessions"]
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Mapping of agent names to their functions
+agent_map = {
+    "Writer": writer_agent,
+    "Director": director_agent,
+    "Casting": casting_agent,
+    "AD": ad_agent,
+    "VideoDesign": video_design_agent,
+    "Editor": editor_agent,
+}
 
 class StartChatRequest(BaseModel):
     prompt: str
@@ -38,126 +53,6 @@ class EditMessageRequest(BaseModel):
     session_id: str
     message_id: str
     new_message: str
-
-# Helper function to extract episodes from text response
-def extract_episodes_from_response(response_text: str) -> list:
-    """
-    DEPRECATED: This function is maintained for backward compatibility.
-    New code should directly use the structured JSON response instead.
-    
-    Extract episodes from the response text and return a list of episode objects
-    """
-    import re
-    episodes = []
-    
-    try:
-        print(f"\n🔍 PARSING: Using deprecated episode extraction function ({len(response_text)} chars)")
-        
-        # First try to find and extract JSON from code blocks (new format)
-        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_text)
-        if json_match:
-            try:
-                json_text = json_match.group(1).strip()
-                print(f"🔍 PARSING: Found JSON block in code fence ({len(json_text)} chars)")
-                parsed_json = json.loads(json_text)
-                
-                if isinstance(parsed_json, dict) and "episodes" in parsed_json:
-                    print(f"🔍 PARSING: Extracting episodes from JSON block")
-                    episodes_data = parsed_json["episodes"]
-                    series_title = parsed_json.get("series_title", "Untitled Series")
-                    
-                    for ep in episodes_data:
-                        episode_obj = {
-                            "episode_number": ep.get("episode_number", 0),
-                            "series_title": series_title,
-                            "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
-                            "summary": ep.get("summary", "No summary available"),
-                            "full_data": ep
-                        }
-                        episodes.append(episode_obj)
-                    
-                    print(f"🔍 PARSING: Successfully extracted {len(episodes)} episodes from JSON")
-                    return episodes  # Return early if we found episodes in JSON
-            except json.JSONDecodeError as e:
-                print(f"🔍 PARSING: Error parsing JSON from code block: {e}")
-        
-        # If no JSON found, use GPT to convert the response into structured JSON
-        if not episodes:
-            print(f"🔍 PARSING: No JSON found, requesting GPT to structure the data")
-            
-            # Use GPT to convert the unstructured text into structured JSON
-            prompt = f"""
-You are a data extraction specialist. Please convert the following text into structured JSON.
-Extract all episode information (title, number, and summary) into a JSON object.
-
-Input text:
-{response_text[:4000]}  # Limit to first 4000 chars to avoid token limits
-
-Return ONLY a valid JSON object in this exact format without any additional text:
-```json
-{{
-  "series_title": "The series title or 'Untitled Series' if not clear",
-  "episodes": [
-    {{
-      "episode_number": 1,
-      "episode_title": "The title of episode 1",
-      "summary": "The summary of episode 1"
-    }},
-    ...more episodes...
-  ]
-}}
-```
-
-Do not include any explanations, just the JSON.
-"""
-            try:
-                # Call GPT to structure the data
-                response = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo-0125",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=2000
-                )
-                
-                gpt_response = response.choices[0].message.content.strip()
-                
-                # Extract JSON from the response
-                json_match = re.search(r'```json\s*([\s\S]*?)\s*```', gpt_response)
-                if json_match:
-                    json_text = json_match.group(1).strip()
-                else:
-                    # If no code block, try to parse the entire response as JSON
-                    json_text = gpt_response
-                
-                # Try to parse the JSON
-                parsed_json = json.loads(json_text)
-                
-                if isinstance(parsed_json, dict) and "episodes" in parsed_json:
-                    episodes_data = parsed_json["episodes"]
-                    series_title = parsed_json.get("series_title", "Untitled Series")
-                    
-                    for ep in episodes_data:
-                        episode_obj = {
-                            "episode_number": ep.get("episode_number", 0),
-                            "series_title": series_title,
-                            "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
-                            "summary": ep.get("summary", "No summary available"),
-                            "full_data": ep
-                        }
-                        episodes.append(episode_obj)
-                    
-                    print(f"🔍 PARSING: Successfully extracted {len(episodes)} episodes using GPT")
-                    return episodes
-                else:
-                    print(f"🔍 PARSING: GPT response didn't contain proper episodes structure")
-            except Exception as e:
-                print(f"❌ ERROR: Failed to structure data with GPT: {e}")
-    
-    except Exception as e:
-        print(f"❌ ERROR: Error extracting episodes: {e}")
-    
-    # Return whatever episodes we found, or empty list if none
-    return episodes
 
 # Helper function to determine response type
 def determine_response_type(text: str) -> str:
@@ -236,315 +131,108 @@ async def generate_chat_suggestions(session_id: str, recent_messages: list = Non
         
         last_ai_response = ai_responses[-1].get("message", "")
         
-        # Use the Producer agent to determine which agent should handle the next interaction
-        prompt = f"""
-You are the Producer Agent in a multi-agent AI filmmaking pipeline.
-
-Based on the current state and user input, choose the next AGENT to run.
-
-Available agents:
-Writer, Director, Casting, AD, VideoDesign, Editor
-
-Guidance:
-- If the user asks about story, script, plot, episode, or scene → return Writer
-- If the user asks about characters or visuals → return Casting
-- Return ONLY one valid agent name from the list above. No explanations.
-
-User input: {last_ai_response}
-"""
-        
-        # Get agent recommendation from the Producer
-        agent_response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=20
-        )
-        
-        agent_type = agent_response.choices[0].message.content.strip()
-        
-        # Generate suggestions based on the selected agent type - simple action phrases
-        if agent_type == "Writer":
-            return [
-                "Develop Plot",
-                "Create Episodes",
-                "Write Dialogue" 
-            ]
-        elif agent_type == "Casting":
-            return [
-                "Create Characters",
-                "Define Relationships",
-                "Add Character Details"
-            ]
-        elif agent_type == "Director":
-            return [
-                "Set Tone",
-                "Plan Scenes",
-                "Direct Actors"
-            ]
-        elif agent_type == "VideoDesign":
-            return [
-                "Create Scene Images",
-                "Design Visuals",
-                "Set Aesthetics"
-            ]
-        elif agent_type == "Editor":
-            return [
-                "Edit Scenes",
-                "Refine Plot",
-                "Review Story"
-            ]
-        elif agent_type == "AD":
-            return [
-                "Schedule Production",
-                "Plan Logistics",
-                "Manage Resources"
-            ]
-        else:
-            return [
-                "Create Characters",
-                "Create Scene Images"
-            ]
-            
+        # Generate suggestions based on the agent type
+        return [
+            "Develop the story",
+            "Create characters",
+            "Generate visuals"
+        ]
     except Exception as e:
         print(f"Error generating chat suggestions: {e}")
         return ["Create Characters", "Create Scene Images"]
 
-# Generate summary of script content
-async def generate_synopsis(script_content: str) -> str:
-    """Generate a concise summary of the script content"""
+# Helper functions for formatting markdown responses
+def format_episodes_as_markdown(episodes):
     try:
-        if not script_content or len(script_content) < 50:
-            return "No content available for summary."
+        markdown = "# Series Episodes\n\n"
+        if not episodes:
+            return "No episodes available."
+            
+        for episode in episodes:
+            episode_number = episode.get("episode_number", 0)
+            title = episode.get("episode_title", f"Episode {episode_number}")
+            summary = episode.get("summary", "No summary available")
+            
+            markdown += f"## Episode {episode_number}: {title}\n\n"
+            markdown += f"{summary}\n\n"
         
-        # Use a more concise prompt for summary generation
-        prompt = f"""
-You are a professional script summarizer. Create a brief, engaging synopsis of this script.
-Focus on the main concept, themes, and overall arc in 2-3 paragraphs.
-Do not include episode breakdowns, just an overall summary. Be concise but compelling.
-
-SCRIPT:
-{script_content[:4000]}  # Limit to avoid token limits
-
-Return ONLY the synopsis text without additional explanations, comments, or headers.
-"""
-
-        print(f"Generating synopsis from script ({len(script_content)} chars)")
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=300
-        )
-        
-        synopsis = response.choices[0].message.content.strip()
-        print(f"Generated synopsis: {len(synopsis)} chars")
-        return synopsis
+        return markdown
     except Exception as e:
-        print(f"Error generating synopsis: {e}")
-        return "Synopsis unavailable. Please check back later."
+        print(f"Error formatting episodes: {e}")
+        return "Error formatting episodes."
 
-# Extract character names from script content
-async def extract_character_names(script_content: str) -> list:
-    """Extract character names from the script content"""
+def format_episode_scripts_as_markdown(episode_scripts, structured_scenes=None):
     try:
-        if not script_content or len(script_content) < 50:
-            print(f"Script content too short for character extraction")
-            return []
+        markdown = "# Episode Scenes\n\n"
+        if not episode_scripts and not structured_scenes:
+            return "No episode scripts available."
         
-        print(f"Extracting characters from script ({len(script_content)} chars)")
-        print(f"Script sample: {script_content[:200]}...")
-        
-        # First try direct pattern matching to identify characters section
-        char_section_match = re.search(r'(?:Characters|Character Profiles|Character List)\s*(?:\n|:)(.*?)(?:\n\s*\n\s*[A-Z#]|\n\s*Episode|\n\s*##|\n\s*Series|\n\s*Plot)',
-                                       script_content, re.DOTALL | re.IGNORECASE)
-        
-        if char_section_match:
-            char_section = char_section_match.group(1).strip()
-            print(f"Found character section in script: {len(char_section)} chars")
-            print(f"Character section: {char_section}")
-            
-            # Extract character names from character section
-            char_names = []
-            char_lines = char_section.split('\n')
-            
-            print(f"Processing {len(char_lines)} character lines")
-            for line in char_lines:
-                if not line.strip():
-                    continue
+        # Use structured format if available
+        if structured_scenes:
+            for episode_num, scenes in structured_scenes.items():
+                markdown += f"## Episode {episode_num}\n\n"
                 
-                print(f"Processing line: {line}")
-        
-                # Try to match different character pattern formats
-                
-                # Format: "Character 1: Jack - A businessman"
-                char_pattern1 = re.search(r'(?:Character\s*\d+\s*:?\s*)([A-Z][a-zA-Z\s]+?)(?:\s*[-:]\s*|\s*,\s*|\s*$)', line)
-            
-                # Format: "Jack - A businessman"
-                char_pattern2 = re.search(r'^([A-Z][a-zA-Z\s]+?)(?:\s*[-:]\s*|\s*,\s*)', line)
-            
-                # Format: "** Jack:**" or "**Jack -**"
-                char_pattern3 = re.search(r'\*\*\s*([A-Z][a-zA-Z\s]+?)(?:\s*[-:]\*\*|\s*\*\*)', line)
-                
-                # Format: "-Henry:An introverted scientist" (dash prefix with no space after colon)
-                char_pattern4 = re.search(r'-\s*([A-Z][a-zA-Z\s]+?)[:]\s*', line)
-                
-                # Format: "-Henry" (just the name with dash prefix)
-                char_pattern5 = re.search(r'-\s*([A-Z][a-zA-Z\s]+?)(?:\s*$)', line)
-                
-                name_match = char_pattern1 or char_pattern2 or char_pattern3 or char_pattern4 or char_pattern5
-                
-                if name_match:
-                    char_name = name_match.group(1).strip()
-                    if char_name and len(char_name) > 1:  # Avoid single letters
-                        print(f"Found character: {char_name}")
-                        char_names.append(char_name)
-            else:
-                    print(f"No character match found in line: {line}")
-            
-            print(f"Extracted {len(char_names)} character names using pattern matching: {char_names}")
-            if char_names:
-                return char_names
-            else:
-                print(f"No characters found with pattern matching, trying backup method")
-                
-                # Backup method - look for dash-prefixed names
-                dash_names = []
-                for line in char_lines:
-                    if line.strip().startswith('-'):
-                        # Extract the text after dash until a colon or space
-                        name_part = line.strip()[1:].strip()
-                        if ':' in name_part:
-                            name = name_part.split(':', 1)[0].strip()
-                        else:
-                            name = name_part.split(' ', 1)[0].strip()
-                        
-                        if name and len(name) > 1 and name[0].isupper():
-                            print(f"Found character with backup method: {name}")
-                            dash_names.append(name)
-                
-                if dash_names:
-                    print(f"Extracted {len(dash_names)} character names using backup method: {dash_names}")
-                    return dash_names
-        else:
-            print(f"Could not identify character section in script")
-        
-        # If pattern matching fails, use GPT to extract characters
-        print(f"Using GPT to extract character names from script")
-        prompt = f"""
-You are a character extraction specialist. Based on this script, list ONLY the names of main characters.
-Return ONLY the character names, one per line, with no numbering, explanations, or other text.
-Look for character introductions, dialogue, and any character lists or descriptions.
-
-SCRIPT:
-{script_content[:4000]}  # Limit to avoid token limits
-
-Examples of correct output format:
-Jack
-Rose
-Bob
-"""
-
-        print(f"Sending GPT request for character extraction")
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=100
-        )
-        
-        extracted_names = response.choices[0].message.content.strip().split('\n')
-        # Clean up names (remove any non-name text)
-        char_names = [name.strip() for name in extracted_names if name.strip() and len(name.strip()) > 1]
-        print(f"Extracted {len(char_names)} character names using GPT: {char_names}")
-        
-        return char_names
-    
-    except Exception as e:
-        print(f"Error extracting character names: {e}")
-        import traceback
-        print(traceback.format_exc())
-        return []
-
-# Create placeholder characters if no matches in database
-async def create_placeholder_characters(character_names: list) -> list:
-    """Create placeholder character objects for script characters not found in database"""
-    if not character_names:
-        return []
-    
-    print(f"Creating placeholder characters for {len(character_names)} names")
-    placeholder_characters = []
-    
-    for name in character_names:
-        print(f"Creating placeholder for character: {name}")
-        placeholder_characters.append({
-            "script_name": name,
-            "db_name": name,
-            "image_url": "",  # No image available
-            "description": f"Character from the script."
-        })
-    
-    return placeholder_characters
-
-# Match script characters with database characters
-async def match_characters_with_database(script_char_names: list, db_characters: list) -> list:
-    """Match character names from script with character profiles in database"""
-    try:
-        if not script_char_names:
-            print(f"No script characters to match")
-            return []
-        
-        if not db_characters:
-            print(f"No database characters to match with - creating placeholders")
-            return await create_placeholder_characters(script_char_names)
-        
-        print(f"Matching {len(script_char_names)} script characters with {len(db_characters)} database characters")
-        matched_characters = []
-        unmatched_names = []
-        
-        # First, direct name matching (case insensitive)
-        for script_char in script_char_names:
-            script_char_lower = script_char.lower()
-            matched = False
-            
-            for db_char in db_characters:
-                try:
-                    db_name = db_char.get("name", "").lower()
+                for scene in scenes:
+                    scene_num = scene.get("scene_number", 0)
+                    scene_title = scene.get("title", f"Scene {scene_num}")
+                    scene_description = scene.get("description", "")
                     
-                    # Check for direct name match or if script name is contained in db name or vice versa
-                    if (script_char_lower == db_name or 
-                        script_char_lower in db_name or 
-                        db_name in script_char_lower):
-                        
-                        # Add character, even if it doesn't have an image
-                        image_url = db_char.get("reference_image", "")
-                        matched_characters.append({
-                            "script_name": script_char,
-                            "db_name": db_char.get("name", "Unknown Character"),
-                            "image_url": image_url,
-                            "description": db_char.get("description", "No description available.")
-                        })
-                        matched = True
-                        print(f"Matched character '{script_char}' with '{db_char.get('name')}'")
-                        break
-                except Exception as e:
-                    print(f"Error processing database character: {e}")
-                    continue
-            
-            if not matched:
-                print(f"Could not match script character '{script_char}' with any database character")
-                unmatched_names.append(script_char)
+                    # Remove the redundant "Scene X:" prefix if it exists
+                    scene_prefix_pattern = re.match(r'^Scene\s*\d+\s*:\s*(.*)', scene_description, re.IGNORECASE)
+                    if scene_prefix_pattern:
+                        scene_description = scene_prefix_pattern.group(1).strip()
+                    
+                    markdown += f"### Scene {scene_num}: {scene_title}\n\n"
+                    markdown += f"{scene_description}\n\n"
+        # Fall back to old format
+        else:
+            for episode_num, scenes in episode_scripts.items():
+                markdown += f"## Episode {episode_num}\n\n"
+                
+                for i, scene in enumerate(scenes):
+                    markdown += f"### Scene {i+1}\n\n"
+                    
+                    # Remove the "Scene X:" prefix if it exists
+                    scene_content = scene
+                    # Using a more flexible regex that captures the scene number pattern
+                    scene_prefix_pattern = re.match(r'^Scene\s*\d+\s*:\s*(.*)', scene, re.IGNORECASE)
+                    if scene_prefix_pattern:
+                        scene_content = scene_prefix_pattern.group(1).strip()
+                    
+                    markdown += f"{scene_content}\n\n"
         
-        # Create placeholders for unmatched characters
-        if unmatched_names:
-            print(f"Creating placeholders for {len(unmatched_names)} unmatched characters")
-            placeholder_chars = await create_placeholder_characters(unmatched_names)
-            matched_characters.extend(placeholder_chars)
-
-        return matched_characters
+        return markdown
     except Exception as e:
-        print(f"Error in match_characters_with_database: {e}")
-        return []
+        print(f"Error formatting episode scripts: {e}")
+        return "Error formatting episode scripts."
+
+def format_scene_scripts_as_markdown(scene_scripts):
+    try:
+        markdown = "# Scene Details\n\n"
+        if not scene_scripts:
+            return "No scene scripts available."
+            
+        for scene_key, shots in scene_scripts.items():
+            match = re.match(r'ep(\d+)_scene(\d+)', scene_key)
+            if match:
+                episode_num, scene_num = match.groups()
+                markdown += f"## Episode {episode_num}, Scene {scene_num}\n\n"
+            else:
+                markdown += f"## {scene_key}\n\n"
+            
+            for i, shot in enumerate(shots):
+                markdown += f"### Shot {i+1}\n\n"
+                
+                if "shot" in shot:
+                    markdown += f"**Visual:** {shot['shot']}\n\n"
+                
+                if "dialogue" in shot:
+                    markdown += f"**Dialogue:** {shot['dialogue']}\n\n"
+        
+        return markdown
+    except Exception as e:
+        print(f"Error formatting scene scripts: {e}")
+        return "Error formatting scene scripts."
 
 @router.post("/chat/start")
 async def start_chat(req: StartChatRequest):
@@ -628,7 +316,6 @@ async def send_chat_message(req: SendChatRequest):
     
     # Use provided prompt or initial prompt (only on first call) or empty string
     prompt = req.prompt if req.prompt else initial_prompt if is_first_call else ""
-    complete_text = ""  # Initialize for use even if no prompt is provided
     
     if prompt:
         print(f"Processing prompt: {prompt[:50]}..." if len(prompt) > 50 else f"Processing prompt: {prompt}")
@@ -673,409 +360,88 @@ async def send_chat_message(req: SendChatRequest):
     else:
         print(f"No story data found for this session or empty data")
     
-    async def event_stream():
-        nonlocal project, complete_text  # Make these variables accessible inside event_stream
-        print(f"Starting event stream for response")
-        # To store the complete response for database update
-        full_response = []
-        suggestions = []
-        episodes = []
-        script_char_names = []  # Initialize this variable
+    # Prepare response structure
+    initial_response = {
+        "prompt": prompt,
+        "left_section": chat_history[:-1] if chat_history and len(chat_history) > 1 else [],
+        "tabs": [],
+        "synopsis": "",
+        "script": "",
+        "character": [],
+        "storyboard": None
+    }
+    
+    # If there's no prompt, just return the initial response with existing data
+    if not prompt:
+        return initial_response
+    
+    try:
+        # Generate thinking process asynchronously
+        thinking_process = await generate_thinking_process(prompt)
+        print(f"Generated thinking process: {len(thinking_process)} chars")
         
-        # Start streaming structured response - first send prompt
-        initial_response = {
-            "prompt": prompt,
-            "left_section": chat_history[:-1] if chat_history and len(chat_history) > 1 else [],
-            "tabs": [],
-            "synopsis": "",
-            "script": "",
-            "character": [],
-            "storyboard": None
-        }
-        
-        # Send initial structure with prompt and existing chat history (minus latest)
-        yield f"data: RESPONSE_JSON: {json.dumps(initial_response)}\n\n"
-        
-        # If there's a prompt, process it
-        if prompt:
-            print(f"Prompt provided, will generate response using run_producer_stream")
-            
-            # First generate the thinking process
-            print(f"Generating thinking process")
-            try:
-                thinking_process = await generate_thinking_process(prompt)
-                print(f"Generated thinking process: {len(thinking_process)} chars")
-                
-                # Create streamed left section with thinking process
-                streamed_left_section = chat_history.copy()
-                if not streamed_left_section:
-                    streamed_left_section.append({
-                        "receiver": {
-                            "time": str(datetime.utcnow()),
-                            "message": thinking_process
-                        }
-                    })
-                else:
-                    # Add a new receiver message
-                    streamed_left_section.append({
-                        "receiver": {
-                            "time": str(datetime.utcnow()),
-                            "message": thinking_process
-                        }
-                    })
-                
-                # Create thinking response structure
-                thinking_response = {
-                    "prompt": prompt,
-                    "left_section": streamed_left_section,
-                    "tabs": [],
-                    "synopsis": "",
-                    "script": "",  # Keep script empty initially
-                    "character": [],
-                    "storyboard": None
-                }
-                
-                # Stream the thinking process
-                yield f"data: THINKING_PROCESS: {thinking_process}\n\n"
-                yield f"data: RESPONSE_JSON: {json.dumps(thinking_response)}\n\n"
-                
-                # Small delay for UI clarity before main response
-                await asyncio.sleep(0.5)
-                
-                # Now prepare for main response streaming
-                current_receiver_message = thinking_process  # Keep thinking process in message
-                current_script = ""  # Separate variable for script content
-                
-                # Stream the producer response
-                try:
-                    async for chunk in run_producer_stream(state, req.session_id, prompt):
-                        print(f"Producer chunk received: {chunk[:30]}..." if len(chunk) > 30 else f"Producer chunk: {chunk}")
-                        
-                        if chunk.startswith("data: ") and "ResponseType" not in chunk and "[DONE]" not in chunk and "ThinkingProcess" not in chunk and "SUGGESTIONS:" not in chunk:
-                            content = chunk[6:].strip()  # Remove "data: " prefix
-                            if content:
-                                full_response.append(content)
-                                print(f"Added content chunk to full_response ({len(content)} chars)")
-                                
-                                # Update both script and complete_text
-                                current_script += content
-                                complete_text += content
-                                
-                                # Keep the thinking process in message, update script
-                                streaming_response = {
-                                    "prompt": prompt,
-                                    "left_section": streamed_left_section,
-                                    "tabs": suggestions,
-                                    "synopsis": "",
-                                    "script": current_script,
-                                    "character": [],
-                                    "storyboard": None
-                                }
-                                
-                                yield f"data: RESPONSE_JSON: {json.dumps(streaming_response)}\n\n"
-                        
-                        elif chunk.startswith("data: SUGGESTIONS:"):
-                            suggestions_str = chunk[16:].strip()
-                            try:
-                                suggestions = json.loads(suggestions_str)
-                                print(f"Received suggestions: {suggestions}")
-                                
-                                streaming_response = {
-                                    "prompt": prompt,
-                                    "left_section": streamed_left_section,
-                                    "tabs": suggestions,
-                                    "synopsis": "",
-                                    "script": current_script,
-                                    "character": [],
-                                    "storyboard": None
-                                }
-                                
-                                yield f"data: RESPONSE_JSON: {json.dumps(streaming_response)}\n\n"
-                            except json.JSONDecodeError as e:
-                                print(f"Error parsing suggestions JSON: {e}")
-                except Exception as e:
-                    print(f"ERROR during run_producer_stream: {str(e)}")
-                    import traceback
-                    print(traceback.format_exc())
-            except Exception as e:
-                print(f"Error generating thinking process: {e}")
-                thinking_process = f"## My Approach\n\nI will help you with: '{prompt}'"
-            
-            # Generate suggestions if needed
-            if not suggestions:
-                print(f"Generating suggestions based on conversation")
-                suggestions = await generate_chat_suggestions(req.session_id)
-                print(f"Generated {len(suggestions)} suggestions: {suggestions}")
-            
-            # Determine response type based on complete text
-            print(f"Determining response type")
-            response_type = determine_response_type(complete_text if complete_text else thinking_process)
-            print(f"Response type determined: {response_type}")
-            
-            # Extract episodes if present in the response
-            print(f"Checking for episodes in response")
-            try:
-                # First try to extract episodes using markdown section headers
-                episode_sections = re.findall(r'###\s*Episode\s*\d+[:\s]+(.*?)(?=###|$)', complete_text, re.DOTALL | re.IGNORECASE)
-                if episode_sections:
-                    print(f"Found {len(episode_sections)} episode sections using markdown headers")
-                    series_title = re.search(r'#\s*(.*?)(?=##|\n|$)', complete_text)
-                    series_title = series_title.group(1).strip() if series_title else "Untitled Series"
-                    
-                    for i, section in enumerate(episode_sections, 1):
-                        # Clean up the section text
-                        section = section.strip()
-                        # Try to extract title and summary
-                        title_match = re.search(r'^([^.\n]+)', section)
-                        title = title_match.group(1).strip() if title_match else f"Episode {i}"
-                        summary = section.replace(title, '').strip(' :\n.')
-                        
-                        episode_obj = {
-                            "episode_number": i,
-                            "series_title": series_title,
-                            "title": title,
-                            "summary": summary,
-                            "full_data": {
-                                "episode_number": i,
-                                "episode_title": title,
-                                "summary": summary
-                            }
-                        }
-                        episodes.append(episode_obj)
-                    print(f"Processed {len(episodes)} episodes from markdown sections")
-                
-                # If no episodes found from markdown, try JSON format
-                if not episodes:
-                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', complete_text)
-                    if json_match:
-                        print(f"Found JSON data in markdown code block")
-                        json_text = json_match.group(1).strip()
-                        print(f"Parsing JSON data ({len(json_text)} chars)")
-                        json_data = json.loads(json_text)
-                        
-                        if isinstance(json_data, dict) and "episodes" in json_data:
-                            print(f"Found episodes key in JSON data with {len(json_data['episodes'])} episodes")
-                            raw_episodes = json_data.get("episodes", [])
-                            series_title = json_data.get("series_title", "Untitled Series")
-                            
-                            print(f"Processing episodes from JSON data")
-                            for ep in raw_episodes:
-                                episode_obj = {
-                                    "episode_number": ep.get("episode_number", 0),
-                                    "series_title": series_title,
-                                    "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
-                                    "summary": ep.get("summary", "No summary available"),
-                                    "full_data": ep
-                                }
-                                episodes.append(episode_obj)
-                            print(f"Processed {len(episodes)} episodes from JSON data")
-                
-                # If still no episodes found, check story state
-                if not episodes:
-                    print(f"No episodes found in response, checking story state")
-                    if project and project.get("story_data") and "episodes" in project.get("story_data", {}):
-                        print(f"Found episodes in story data")
-                        state_episodes = project["story_data"].get("episodes", [])
-                        series_title = project["story_data"].get("title", "Untitled Series")
-                        
-                        print(f"Processing {len(state_episodes)} episodes from story state")
-                        for ep in state_episodes:
-                            episode_obj = {
-                                "episode_number": ep.get("episode_number", 0),
-                                "series_title": series_title,
-                                "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
-                                "summary": ep.get("summary", "No summary available"),
-                                "full_data": ep
-                            }
-                            episodes.append(episode_obj)
-                        print(f"Processed {len(episodes)} episodes from story state")
-                    else:
-                        print(f"No episodes found in story state")
-            except Exception as e:
-                print(f"ERROR processing episodes: {str(e)}")
-                import traceback
-                print(traceback.format_exc())
-            
-            # Create response message
-            print(f"Creating nexora response message for database")
-            
-            # Generate structured JSON data for database storage
-            if complete_text:
-                print(f"Generating structured JSON data for database")
-                structured_data = await generate_structured_story_data(complete_text)
-                if structured_data:
-                    print(f"Successfully generated structured data")
-                    episodes = []
-                    if "episodes" in structured_data:
-                        for ep in structured_data["episodes"]:
-                            episode_obj = {
-                                "episode_number": ep.get("episode_number", 0),
-                                "series_title": structured_data.get("series_title", "Untitled Series"),
-                                "title": ep.get("episode_title", f"Episode {ep.get('episode_number', 0)}"),
-                                "summary": ep.get("summary", "No summary available"),
-                                "full_data": ep
-                            }
-                            episodes.append(episode_obj)
-                        print(f"Processed {len(episodes)} episodes from structured data")
-                        
-                        # Update story data in the database
-                        if project:
-                            update_data = {
-                                "story_data.episodes": structured_data["episodes"],
-                                "story_data.series_title": structured_data.get("series_title", "Untitled Series")
-                            }
-                            story_projects.update_one(
-                                {"session_id": req.session_id},
-                                {"$set": update_data}
-                            )
-                            print(f"Updated story data in database with structured data")
-            
-            nexora_response = {
-                "sender": "nexora",
-                "message": complete_text if complete_text else thinking_process,  # Keep markdown for frontend
-                "thinking_process": thinking_process,
-                "timestamp": datetime.utcnow(),
-                "suggestions": suggestions,
-                "response_type": response_type,
-                "has_episodes": len(episodes) > 0,
-                "message_id": str(uuid.uuid4())
+        # Create response with thinking process
+        streamed_left_section = chat_history.copy()
+        streamed_left_section.append({
+            "receiver": {
+                "time": str(datetime.utcnow()),
+                "message": thinking_process
             }
-            print(f"Created response with message_id: {nexora_response['message_id']}")
-            
-            # Add episodes if they exist
-            if episodes:
-                print(f"Adding {len(episodes)} episodes to response")
-                nexora_response["episodes"] = episodes
-            
-            # Add script if available
-            if complete_text:
-                print(f"Adding script content to response")
-                nexora_response["script"] = complete_text
-            
-            # Add the message to the database
-            print(f"Storing nexora response in database")
-            chat_sessions.update_one(
-                {"session_id": req.session_id},
-                {"$push": {"messages": nexora_response}}
-            )
-            print(f"Nexora response stored successfully")
-            
-            # Update final chat history with the new response
-            print(f"Updating chat history with new response")
-            chat_history.append({
-                "receiver": {
-                    "time": str(nexora_response["timestamp"]),
-                    "message": nexora_response["message"]  # Use the complete message
-                }
-            })
-            print(f"Chat history updated, now has {len(chat_history)} entries")
-        else:
-            # If no prompt, just get suggestions from the existing conversation
-            print(f"No prompt provided, generating suggestions from existing conversation")
-            suggestions = await generate_chat_suggestions(req.session_id)
-            print(f"Generated {len(suggestions)} suggestions: {suggestions}")
+        })
         
-        # Get character images if available
-        print(f"Fetching character images")
-        character_images = []
+        # Get the complete response from run_producer_stream
+        response_text = await run_producer_stream(state, req.session_id, prompt)
+        print(f"Got complete response: {len(response_text)} chars")
         
-        try:
-            # Fetch latest project data to ensure we have the most recent character profiles
-            project = story_projects.find_one({"session_id": req.session_id})
-            
-            if project and "story_data" in project and "character_profiles" in project["story_data"]:
-                character_profiles = project["story_data"]["character_profiles"]
-                print(f"Found {len(character_profiles)} character profiles in database")
-                
-                for profile in character_profiles:
-                    if isinstance(profile, dict) and "name" in profile:  # Ensure profile is valid
-                        character_images.append({
-                            "name": profile.get("name", "Unknown Character"),
-                            "image_url": profile.get("reference_image", ""),
-                            "description": profile.get("description", "No description available")
-                        })
-                        print(f"Added character: {profile.get('name')}")
-            else:
-                print(f"No character profiles found in database")
-                character_images = []
-        except Exception as e:
-            print(f"ERROR fetching character profiles: {str(e)}")
-            import traceback
-            print(traceback.format_exc())
-            character_images = []
+        # Get suggestions for the UI
+        suggestions = await generate_chat_suggestions(req.session_id)
         
-        # Debug output
-        print(f"DEBUG: Final character count before response: {len(character_images)}")
-        for idx, char in enumerate(character_images):
-            print(f"DEBUG: Character {idx+1}: {char.get('name')}, Image: {bool(char.get('image_url'))}")
+        # Create Nexora response message
+        # IMPORTANT: We'll store the full response in the database but only show thinking process in UI
+        nexora_message = {
+            "sender": "nexora",
+            "message": response_text,  # Store full response in DB
+            "timestamp": datetime.utcnow(),
+            "response_type": determine_response_type(response_text),
+            "message_id": str(uuid.uuid4()),
+            "thinking_process": thinking_process  # Add thinking process to the message
+        }
         
-        # Construct the final response object
-        print(f"Constructing final response object")
+        # Store in database
+        chat_sessions.update_one(
+            {"session_id": req.session_id},
+            {"$push": {"messages": nexora_message}}
+        )
         
-        # For synopsis content
-        synopsis_content = ""
+        # For the left_section in the UI, we'll only show the thinking process, not the full response
+        # This is the key change being made - we're not adding the response_text to the left_section
         
-        # If we have new script content, generate a synopsis
-        if complete_text and len(complete_text) > 50:
-            print(f"Generating synopsis from script content")
-            synopsis_content = await generate_synopsis(complete_text)
-            print(f"Synopsis generated: {len(synopsis_content)} chars")
-            
-            # Save the synopsis and script character names to the database
-            if project:
-                print(f"Saving synopsis and script characters to database")
-                update_data = {
-                    "story_data.synopsis": synopsis_content
-                }
-                
-                if script_char_names:
-                    update_data["story_data.script_characters"] = script_char_names
-                
-                story_projects.update_one(
-                    {"session_id": req.session_id},
-                    {"$set": update_data}
-                )
-                print(f"Saved synopsis and {len(script_char_names)} script characters to database")
-        # If no new content but we're retrieving existing data
-        elif not prompt and project and "story_data" in project:
-            story_data = project.get("story_data", {})
-            if "synopsis" in story_data:
-                synopsis_content = story_data.get("synopsis", "")
-                print(f"Using existing synopsis from story_data ({len(synopsis_content)} chars)")
-            else:
-                print(f"No synopsis found in story_data")
-                synopsis_content = "Synopsis will be generated after more content is available."
+        # Get character data if available
+        character_data = []
+        if project and project.get("story_data") and "character_profiles" in project.get("story_data", {}):
+            character_profiles = project["story_data"]["character_profiles"]
+            print(f"Found {len(character_profiles)} character profiles in database")
+            character_data = character_profiles
         
-        # Prepare the final response
-        response = {
+        # Create final response
+        final_response = {
             "prompt": prompt,
-            "left_section": chat_history,
+            "left_section": streamed_left_section,  # This now has thinking_process instead of full response
             "tabs": suggestions,
-            "synopsis": synopsis_content,
-            "script": complete_text,
-            "character": character_images,
+            "synopsis": state.logline if hasattr(state, "logline") else "",
+            "script": response_text,  # Full script is still sent in the script field
+            "character": character_data,
             "storyboard": None
         }
-        print(f"Response object constructed with {len(chat_history)} chat history entries, {len(suggestions)} tabs, {len(character_images)} character images")
         
-        # Send the final JSON response
-        print(f"Serializing response object to JSON")
-        response_json = json.dumps(response)
-        print(f"Response JSON created ({len(response_json)} chars)")
-        
-        # Print the full response JSON for debugging
-        print("\n====== FULL RESPONSE JSON ======")
-        print(response_json)
-        print("===============================\n")
-        
-        print(f"Sending RESPONSE_JSON event")
-        yield f"data: RESPONSE_JSON: {response_json}\n\n"
-        print(f"Sending [DONE] event")
-        yield f"data: [DONE]\n\n"
-        print(f"Event stream complete")
-
-    print(f"Returning StreamingResponse")
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+        print(f"Returning complete JSON response")
+        return final_response
+    except Exception as e:
+        print(f"Error in send_chat_message: {e}")
+        import traceback
+        print(traceback.format_exc())
+        # Use HTTPException instead of JSONResponse for consistency
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 @router.patch("/chat/message")
 async def edit_message(req: EditMessageRequest):
@@ -1096,6 +462,12 @@ async def edit_message(req: EditMessageRequest):
             message["edited_at"] = datetime.utcnow()
             message["was_edited"] = True
             
+            # If this is a Nexora message, also update thinking_process if available
+            if message.get("sender") == "nexora" and "thinking_process" in message:
+                # For now, we'll keep the thinking_process unchanged
+                # In a future version, you might want to regenerate the thinking process or allow editing it
+                pass
+            
             updated_message = message
             message_found = True
             break
@@ -1115,51 +487,3 @@ async def edit_message(req: EditMessageRequest):
         "message": "Message updated successfully",
         "updated_message": updated_message
     }
-
-async def generate_structured_story_data(markdown_text: str) -> dict:
-    """Generate structured JSON story data from markdown text using GPT"""
-    try:
-        prompt = f"""
-Convert this story markdown into a structured JSON format.
-Extract the series title, episodes, and any character information.
-
-MARKDOWN TEXT:
-{markdown_text}
-
-Return ONLY valid JSON in this exact format (no explanation needed):
-{{
-    "series_title": "The title of the series",
-    "episodes": [
-        {{
-            "episode_number": 1,
-            "episode_title": "Title of episode 1",
-            "summary": "Summary of episode 1"
-        }},
-        // ... more episodes
-    ]
-}}
-"""
-        
-        print(f"Requesting GPT to structure story data")
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=2000
-        )
-        
-        structured_data = response.choices[0].message.content.strip()
-        print(f"Received structured data from GPT")
-        
-        # Parse the response to ensure it's valid JSON
-        try:
-            json_data = json.loads(structured_data)
-            print(f"Successfully parsed structured data with {len(json_data.get('episodes', []))} episodes")
-            return json_data
-        except json.JSONDecodeError as e:
-            print(f"Error parsing GPT response as JSON: {e}")
-            return None
-            
-    except Exception as e:
-        print(f"Error generating structured data: {e}")
-        return None

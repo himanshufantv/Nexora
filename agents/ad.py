@@ -284,9 +284,18 @@ Text: {summary}
     return state, False
 
 @log_entry_exit
-def ad_agent(state: StoryState) -> StoryState:
+def ad_agent(state: StoryState, episode_number=None, scene_number=None, seed=None) -> StoryState:
     print("🎬 Running AD Agent to generate all shot images...")
     print(f"✅ REPLICATE_API_TOKEN is {'SET' if os.getenv('REPLICATE_API_TOKEN') else 'NOT SET'}")
+    
+    # Track the last seed used for returning to caller
+    last_generated_seed = None
+    
+    # Check if we're targeting a specific episode/scene
+    is_specific_request = episode_number is not None and scene_number is not None
+    if is_specific_request:
+        print(f"🎯 Targeting specific episode {episode_number}, scene {scene_number}" + 
+              (f" with seed {seed}" if seed else ""))
     
     # Ensure character profiles exist before proceeding
     state, characters_updated = ensure_character_profiles(state)
@@ -306,9 +315,10 @@ def ad_agent(state: StoryState) -> StoryState:
         except Exception as e:
             print(f"❌ Error updating character profiles in DB: {e}")
     
-    ad_prompts = {}
-    ad_images = {}
-    ad_character_info = {}  # Store information about which characters are in each shot
+    # Initialize storage dictionaries
+    ad_prompts = state.ad_prompts.copy() if hasattr(state, "ad_prompts") else {}
+    ad_images = state.ad_images.copy() if hasattr(state, "ad_images") else {}
+    ad_character_info = state.ad_character_info.copy() if hasattr(state, "ad_character_info") else {}
 
     scene_background_seeds = {}  # {scene_key: seed}
     finalized_characters = state.character_profiles
@@ -329,12 +339,25 @@ def ad_agent(state: StoryState) -> StoryState:
     # Handle scene scripts if they exist
     if state.scene_scripts:
         print(f"📜 Found {len(state.scene_scripts)} scene scripts to process")
-        for scene_key, shots in state.scene_scripts.items():
+        
+        # If targeting a specific scene, only process that one
+        if is_specific_request:
+            target_scene_key = f"ep{episode_number}_scene{scene_number}"
+            if target_scene_key in state.scene_scripts:
+                scenes_to_process = {target_scene_key: state.scene_scripts[target_scene_key]}
+                print(f"🎯 Found target scene {target_scene_key}, processing only this scene")
+            else:
+                print(f"⚠️ Target scene {target_scene_key} not found in state.scene_scripts")
+                scenes_to_process = {}
+        else:
+            scenes_to_process = state.scene_scripts
+
+        for scene_key, shots in scenes_to_process.items():
             if not shots:
                 continue
 
             # Initialize first background seed for the scene
-            scene_seed = None
+            scene_seed = seed if is_specific_request and scene_key == target_scene_key else None
 
             for idx, shot_info in enumerate(shots):
                 shot_text = shot_info.get("shot", "")
@@ -410,6 +433,7 @@ Respond ONLY with the image prompt.
                     image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
                     if used_seed is not None:
                         scene_seed = used_seed
+                        last_generated_seed = used_seed  # Store for returning to caller
                         print(f"Generated seed {scene_seed} will be used for subsequent shots in this scene")
                 else:
                     print(f"========== CHARACTER SCENE IMAGE GENERATION ==========")
@@ -421,6 +445,7 @@ Respond ONLY with the image prompt.
                     print(f"Character pair: {char_pair}")
                     print(f"Reusing scene seed: {scene_seed}")
                     image_url, _ = generate_flux_image(image_prompt, hf_lora=lora_to_use, seed=scene_seed)
+                    last_generated_seed = scene_seed  # Store for returning to caller
 
                 if not image_url:
                     print(f"❌ Failed to generate image for {unique_key}.")
@@ -436,7 +461,21 @@ Respond ONLY with the image prompt.
         # Track seeds for episodes to maintain visual consistency across related images
         episode_seeds = {}  # {episode_num: seed}
         
-        for i, episode in enumerate(state.episodes[:3]):  # Limit to first 3 episodes
+        # If targeting a specific episode, only process that one
+        if is_specific_request:
+            if episode_number <= len(state.episodes):
+                episodes_to_process = [state.episodes[episode_number-1]]
+                episodes_indices = [episode_number-1]
+                print(f"🎯 Found target episode {episode_number}, processing only this episode")
+            else:
+                print(f"⚠️ Target episode {episode_number} not found in state.episodes")
+                episodes_to_process = []
+                episodes_indices = []
+        else:
+            episodes_to_process = state.episodes[:3]  # Limit to first 3 episodes
+            episodes_indices = range(len(episodes_to_process))
+            
+        for i, episode in zip(episodes_indices, episodes_to_process):
             episode_title = episode.get("episode_title", f"Episode {i+1}")
             summary = episode.get("summary", "")
             
@@ -503,7 +542,11 @@ Keep your description under 100 words and make it visually rich.
             scene_description = response.choices[0].message.content.strip()
             
             # Generate the actual image
-            scene_key = f"episode{i+1}_main"
+            if is_specific_request:
+                scene_key = f"episode_{episode_number}_scene_{scene_number}"
+            else:
+                scene_key = f"episode{i+1}_main"
+                
             ad_prompts[scene_key] = scene_description
             
             # Store character information for this episode image
@@ -532,17 +575,24 @@ Keep your description under 100 words and make it visually rich.
                 print(f"LoRA value: {lora_to_use}")
                 print(f"Character pair: {char_pair}")
                 
-                # Check if we should use a consistent seed for this episode
-                if i in episode_seeds:
+                # Check if we should use a provided seed or a consistent seed for this episode
+                if is_specific_request and seed:
+                    seed_value = seed
+                    print(f"Using provided seed {seed_value} for specific episode/scene request")
+                    image_url, _ = generate_flux_image(scene_description, hf_lora=lora_to_use, seed=seed_value)
+                    last_generated_seed = seed_value
+                elif i in episode_seeds:
                     seed_value = episode_seeds[i]
                     print(f"Using consistent seed {seed_value} for episode {i+1}")
                     image_url, _ = generate_flux_image(scene_description, hf_lora=lora_to_use, seed=seed_value)
+                    last_generated_seed = seed_value
                 else:
                     print(f"Generating first image for episode {i+1} - seed will be auto-generated")
                     image_url, used_seed = generate_flux_image(scene_description, hf_lora=lora_to_use)
                     # Save seed for consistency if one was returned
                     if used_seed is not None:
                         episode_seeds[i] = used_seed
+                        last_generated_seed = used_seed  # Store for returning to caller
                         print(f"Saving seed {used_seed} for episode {i+1} consistency")
                 
                 if not image_url:
@@ -561,10 +611,16 @@ Keep your description under 100 words and make it visually rich.
                     }
                     
                     # Use the same seed if we have one for consistency
-                    if i in episode_seeds:
+                    if is_specific_request and seed:
+                        seed_value = seed
+                        fallback_input["seed"] = seed_value
+                        print(f"Using provided seed {seed_value} in fallback")
+                        last_generated_seed = seed_value
+                    elif i in episode_seeds:
                         seed_value = episode_seeds[i]
                         fallback_input["seed"] = seed_value
                         print(f"Using consistent seed {seed_value} in fallback")
+                        last_generated_seed = seed_value
                         
                     print(f"Fallback input: {fallback_input}")
                     output = replicate.run(
@@ -595,7 +651,8 @@ Keep your description under 100 words and make it visually rich.
     new_state = state.copy(update={
         "ad_prompts": ad_prompts,
         "ad_images": ad_images,
-        "ad_character_info": ad_character_info
+        "ad_character_info": ad_character_info,
+        "last_generated_seed": last_generated_seed  # Add the last used seed to state
     })
 
     log_agent_output("AD", new_state)

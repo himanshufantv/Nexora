@@ -40,12 +40,11 @@ agent_map = {
 }
 
 async def run_producer_stream(state: StoryState, session_id: str, user_message: str):
-    print(f"Starting producer stream for session {session_id}")
+    print(f"Starting producer processing for session {session_id}")
     project = projects.find_one({"session_id": session_id})
     if not project:
         print(f"Session not found: {session_id}")
-        yield "data: Error: session not found.\n\n"
-        return        
+        return "Error: session not found."      
     print(f"Found project for session {session_id}")
     
     if project.get("story_data"):
@@ -53,6 +52,10 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
         print(f"Loaded story data from project")
         state = StoryState(**story_data)
         state.session_id = session_id
+    
+    # Ensure all StoryState attributes are properly initialized
+    state = ensure_state_attributes(state)
+    print(f"State initialized with {len(state.episodes)} episodes, {len(state.episode_scripts)} episode scripts")
        
     try:
         print(f"Determining agent to run based on user message")
@@ -62,17 +65,11 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
         if not agent_to_run or agent_to_run not in agent_map:
             print(f"Invalid agent {agent_to_run}, defaulting to Writer")
             agent_to_run = "Writer"
-
-        # First send response type information
-        yield f"data: ResponseType: {agent_to_run}\n\n"
-        await asyncio.sleep(0.1)
         
         # If user is asking for scene images but was routed to VideoDesign, redirect to AD
         if "scene" in user_message.lower() and "image" in user_message.lower() and agent_to_run == "VideoDesign":
             print("Redirecting from VideoDesign to AD for scene images")
             agent_to_run = "AD"
-            yield f"data: ResponseType: {agent_to_run}\n\n"
-            await asyncio.sleep(0.1)
             
         # Special handling for Casting agent to get images
         if agent_to_run == "Casting":
@@ -93,28 +90,24 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
             if updated_state.character_profiles:
                 print(f"Casting agent returned {len(updated_state.character_profiles)} character profiles with images")
                 
-                # Start with an introduction
-                yield "data: Character visualizations have been generated:\n\n"
-                await asyncio.sleep(0.1)
+                # Format the response as markdown
+                response_text = "# Character Visualizations\n\n"
                 
-                # For each character, send the image URL and description
+                # For each character, add to the markdown response
                 for profile in updated_state.character_profiles:
                     char_name = profile.get("name", "Character")
                     image_url = profile.get("reference_image", "")
                     description = profile.get("description", "")
                     
-                    print(f"Sending character image for {char_name}")
-                    # Send the image URL in a special format the client can handle
-                    if image_url:
-                        yield f"data: IMAGE_URL:{char_name}:{image_url}\n\n"
-                        yield f"data: {char_name} has been visualized with the appearance shown above.\n\n"
-                    else:
-                        print(f"WARNING: No image URL for character {char_name}")
-                        yield f"data: Could not generate an image for {char_name}.\n\n"
+                    print(f"Adding character info for {char_name}")
+                    response_text += f"## {char_name}\n\n"
                     
-                    await asyncio.sleep(0.1)
+                    if image_url:
+                        response_text += f"![{char_name}]({image_url})\n\n"
+                    
+                    response_text += f"{description}\n\n"
                 
-                # Additional: Explicitly save character profiles to database
+                # Additional: Save character profiles to database
                 try:
                     if 'save_characters_to_db' in locals():
                         print(f"Saving character profiles to database")
@@ -128,19 +121,21 @@ async def run_producer_stream(state: StoryState, session_id: str, user_message: 
                 except Exception as char_save_err:
                     print(f"Error saving characters", char_save_err)
                 
-                # Update the state in the database (original method)
+                # Update the state in the database
                 try:
                     log_db_operation("update", "projects", {"session_id": session_id})
                     projects.update_one(
                         {"session_id": session_id},
                         {"$set": {
-                            "story_data": updated_state.dict(),
+                            "story_data": updated_state.model_dump(),
                             "updated_at": datetime.utcnow()
                         }}
                     )
                     print(f"Updated state in database with character images and details")
                 except Exception as db_err:
                     print(f"Database update error", db_err)
+                
+                return response_text
             else:
                 # Fallback to description generation if no images are found
                 print(f"WARNING: No character profiles with images generated, falling back to text descriptions")
@@ -151,848 +146,308 @@ Based on these character descriptions, provide detailed visual descriptions:
 {chr(10).join(state.characters)}
 
 For each character, describe their physical appearance, age, clothing style, and distinguishing features.
+Format your response in markdown with appropriate headers.
 """
                 log_api_call("OpenAI Chat Completion")
                 response = openai_client.chat.completions.create(
                     model="gpt-4",
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.7,
-                    stream=True
+                    temperature=0.7
                 )
                 
-                buffer = ""
-                stop_streaming = False
-                for chunk in response:
-                    if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        buffer += content
-                        
-                        # If we already hit the JSON section, don't stream
-                        if stop_streaming:
-                            continue
-                            
-                        # Check if we're entering the JSON section
-                        if "```json" in buffer:
-                            # Send whatever is before ```json
-                            parts = buffer.split("```json", 1)
-                            if parts[0].strip():
-                                yield f"data: {parts[0]}\n\n"
-                                await asyncio.sleep(0.01)
-                            
-                            # Clear buffer and set flag to stop streaming
-                            buffer = ""
-                            stop_streaming = True
-                            continue
-                        
-                        import re
-                        if re.search(r'[.!?,;:\s]', buffer) or len(buffer) > 15:
-                            if buffer.strip():
-                                yield f"data: {buffer}\n\n"
-                            buffer = ""
-                
-                if buffer.strip() and not stop_streaming:
-                    yield f"data: {buffer}\n\n"
+                response_text = response.choices[0].message.content
+                return response_text
         
         # Special handling for AD agent to generate scene images
         elif agent_to_run == "AD":
             print(f"Using AD agent for scene image generation")
             
+            # Check if the request is for a specific scene
+            is_specific_scene = False
+            scene_number = 1
+            episode_number = 1
+            
+            # Parse the user message to extract scene and episode numbers
+            if "scene" in user_message.lower():
+                is_specific_scene = True
+                # Try to extract episode and scene numbers
+                episode_match = re.search(r'episode\s*(\d+)', user_message.lower())
+                scene_match = re.search(r'scene\s*(\d+)', user_message.lower())
+                
+                if episode_match:
+                    episode_number = int(episode_match.group(1))
+                    print(f"Detected request for episode {episode_number}")
+                
+                if scene_match:
+                    scene_number = int(scene_match.group(1))
+                    print(f"Detected request for scene {scene_number}")
+                
+                print(f"Will generate images for episode {episode_number}, scene {scene_number}")
+                
+                # Create a scene key to track seeds
+                scene_key = f"episode_{episode_number}_scene_{scene_number}"
+                
+                # Check if we already have a seed for this scene
+                if hasattr(state, "scene_seeds") and scene_key in state.scene_seeds:
+                    existing_seed = state.scene_seeds[scene_key]
+                    print(f"Found existing seed {existing_seed} for {scene_key}")
+                else:
+                    print(f"No existing seed found for {scene_key}, will generate a new one")
+            
             # Check if we have episode scripts or scene scripts
-            if not state.episode_scripts and not state.scene_scripts:
+            has_episode_scripts = hasattr(state, "episode_scripts") and state.episode_scripts
+            has_scene_scripts = hasattr(state, "scene_scripts") and state.scene_scripts
+            
+            if not has_episode_scripts and not has_scene_scripts:
                 # If no existing scenes, create quick scene prompts from episodes
-                if state.episodes:
+                has_episodes = hasattr(state, "episodes") and state.episodes and len(state.episodes) > 0
+                if has_episodes:
                     # Create scene images based on episode summaries
                     print(f"Generating scene visualizations from episode summaries")
-                    yield "data: Generating scene visualizations from episode summaries:\n\n"
+                    response_text = "# Scene Visualizations\n\n"
                     
-                    # Import image generation function
-                    from utils.replicate_image_gen import generate_flux_image
-                    import replicate
-                    print(f"REPLICATE_API_TOKEN is {'SET' if os.getenv('REPLICATE_API_TOKEN') else 'NOT SET'}")
-                    
-                    # Generate scene prompts based on episode summaries
-                    for i, episode in enumerate(state.episodes[:3]):  # Limit to first 3 episodes
-                        episode_title = episode.get("episode_title", f"Episode {i+1}")
-                        summary = episode.get("summary", "")
-                        
-                        print(f"Generating scene image for episode: {episode_title}")
-                        # Generate image prompt for this episode
-                        prompt = f"""
-You are an expert visual artist creating scene descriptions for image generation.
-Create a detailed visual description for this scene that would be good for generating an image.
-Focus on setting, lighting, characters, mood, and visual elements.
-
-Episode: {episode_title}
-Summary: {summary}
-
-Keep your description under 100 words and make it visually rich.
-"""
-                        # Get a scene description
-                        response = openai_client.chat.completions.create(
-                            model="gpt-4",
-                            messages=[{"role": "user", "content": prompt}],
-                            temperature=0.7,
-                            max_tokens=150
-                        )
-                        
-                        scene_description = response.choices[0].message.content.strip()
-                        scene_name = f"Scene from {episode_title}"
-                        
-                        yield f"data: {scene_name}: {scene_description}\n\n"
-                        await asyncio.sleep(0.1)
-                        
-                        # Now generate a real image using Replicate API
-                        try:
-                            # Generate the actual image
-                            print(f"========== SCENE IMAGE GENERATION: {scene_name} ==========")
-                            print(f"Scene description: {scene_description}")
-                            print(f"Calling generate_flux_image for episode summary scene")
-                            image_url, _ = generate_flux_image(scene_description)
-                            
-                            if not image_url:
-                                print("⚠️ Initial image generation failed, trying direct call...")
-                                # Direct call as fallback
-                                try:
-                                    output = replicate.run(
-                                        "black-forest-labs/flux-1.1-pro",
-                                        input={
-                                            "prompt": scene_description,
-                                            "aspect_ratio": "9:16",
-                                            "output_format": "jpg",
-                                            "prompt_strength": 0.8
-                                        }
-                                    )
-                                    
-                                    if isinstance(output, list) and len(output) > 0:
-                                        image_url = str(output[0])
-                                    elif isinstance(output, str):
-                                        image_url = output
-                                    else:
-                                        raise Exception("Unexpected output format from Replicate API")
-                                except Exception as e:
-                                    print(f"❌ Direct Replicate call failed: {e}")
-                                    # Final fallback to placeholder
-                                    image_url = f"https://placehold.co/600x400/png?text={episode_title.replace(' ', '+')}"
-                            
-                            # Send the image URL to the client
-                            yield f"data: IMAGE_URL:{scene_name}:{image_url}\n\n"
-                            await asyncio.sleep(0.1)
-                            
-                            # Update state with the new image
-                            if not hasattr(state, 'ad_images'):
-                                state.ad_images = {}
-                            state.ad_images[f"episode{i+1}_main"] = image_url
-                            
-                        except Exception as e:
-                            print(f"❌ Error generating image: {e}")
-                            # Fallback to placeholder only if real generation fails
-                            placeholder_url = f"https://placehold.co/600x400/png?text={episode_title.replace(' ', '+')}"
-                            yield f"data: IMAGE_URL:{scene_name}:{placeholder_url}\n\n"
-                            await asyncio.sleep(0.1)
-                    
-                    # Save the updated state
+                    # Call AD agent to generate images
                     try:
-                        projects.update_one(
-                            {"session_id": session_id},
-                            {"$set": {"story_data": state.dict(), "updated_at": datetime.utcnow()}}
-                        )
-                        print(f"✅ Updated state in database with generated scene images")
-                    except Exception as db_err:
-                        print(f"❌ Failed to update database: {str(db_err)}")
-                        
-                else:
-                    # No episodes or scenes to generate images from
-                    yield "data: No episodes or scenes found to generate images. Please create a story first.\n\n"
-            else:
-                # If we have scene scripts, use those for more detailed scene images
-                # Run the actual AD agent
-                try:
-                    updated_state = ad_agent(state)
-                    
-                    # Check if we got image URLs
-                    if updated_state.ad_images and len(updated_state.ad_images) > 0:
-                        yield "data: Scene visualizations have been generated:\n\n"
-                        await asyncio.sleep(0.1)
-                        
-                        # For each scene, send the image URL
-                        for scene_key, image_url in updated_state.ad_images.items():
-                            if image_url:
-                                yield f"data: IMAGE_URL:{scene_key}:{image_url}\n\n"
-                                yield f"data: Scene {scene_key} has been visualized.\n\n"
-                                await asyncio.sleep(0.1)
-                        
-                        # Update state
-                        projects.update_one(
-                            {"session_id": session_id},
-                            {"$set": {"story_data": updated_state.dict(), "updated_at": datetime.utcnow()}}
-                        )
-                        print(f"✅ Updated state in database with scene images")
-                    else:
-                        # No images generated, fallback to generating placeholders
-                        yield "data: Generating scene visualizations from episode summaries:\n\n"
-                        
-                        # Generate placeholder images for episodes
-                        if state.episodes:
-                            for i, episode in enumerate(state.episodes[:5]):  # Limit to first 5 episodes
-                                episode_title = episode.get("episode_title", f"Episode {i+1}")
-                                summary = episode.get("summary", "")
-                                
-                                # Generate placeholder image and description
-                                scene_name = f"Scene from {episode_title}"
-                                scene_description = f"Visual representation of: {summary[:100]}..."
-                                
-                                yield f"data: {scene_name}: {scene_description}\n\n"
-                                await asyncio.sleep(0.1)
-                                
-                                # Create a placeholder image URL with episode title
-                                placeholder_url = f"https://placehold.co/600x400/png?text={episode_title.replace(' ', '+')}"
-                                yield f"data: IMAGE_URL:{scene_name}:{placeholder_url}\n\n"
-                                await asyncio.sleep(0.1)
+                        # If specific scene requested, pass scene info to AD agent
+                        if is_specific_scene:
+                            print(f"Calling AD agent with specific scene request: episode {episode_number}, scene {scene_number}")
+                            # Check if we have a seed to pass
+                            if hasattr(state, "scene_seeds") and scene_key in state.scene_seeds:
+                                seed_value = state.scene_seeds[scene_key]
+                                print(f"Passing existing seed {seed_value} for consistent imagery")
+                                updated_state = ad_agent(state, episode_number=episode_number, scene_number=scene_number, seed=seed_value)
+                            else:
+                                updated_state = ad_agent(state, episode_number=episode_number, scene_number=scene_number)
+                                # Check if a seed was generated and save it
+                                if hasattr(updated_state, "ad_images") and scene_key in updated_state.ad_images:
+                                    # Try to extract the seed used from the agent's response
+                                    if not hasattr(updated_state, "scene_seeds"):
+                                        updated_state.scene_seeds = {}
+                                    if hasattr(updated_state, "last_generated_seed") and updated_state.last_generated_seed:
+                                        updated_state.scene_seeds[scene_key] = updated_state.last_generated_seed
+                                        print(f"Saved new seed {updated_state.last_generated_seed} for {scene_key}")
                         else:
-                            yield "data: No episodes found to generate scene visualizations.\n\n"
-                except Exception as e:
-                    print(f"❌ Error running AD agent: {e}")
-                    
-                    # Fallback to generating actual images even if AD agent fails
-                    yield "data: Generating fallback scene visualizations:\n\n"
-                    
-                    # Import image generation function if not already imported
-                    try:
-                        from utils.replicate_image_gen import generate_flux_image
-                        import replicate
-                    except ImportError:
-                        pass
-                    
-                    # Generate real images for episodes
-                    if state.episodes:
-                        for i, episode in enumerate(state.episodes[:3]):  # Limit to first 3 episodes
-                            episode_title = episode.get("episode_title", f"Episode {i+1}")
-                            summary = episode.get("summary", "")
+                            updated_state = ad_agent(state)
                             
-                            # Generate a good description for image generation
-                            prompt_to_gpt = f"""
-You are an expert visual artist creating scene descriptions for image generation.
-Create a detailed visual description for this scene that would be good for generating an image.
-Focus on setting, lighting, characters, mood, and visual elements.
-
-Episode: {episode_title}
-Summary: {summary}
-
-Keep your description under 100 words and make it visually rich.
-"""
-                            response = openai_client.chat.completions.create(
-                                model="gpt-4",
-                                messages=[{"role": "user", "content": prompt_to_gpt}],
-                                temperature=0.7,
-                                max_tokens=150
-                            )
-                            
-                            scene_description = response.choices[0].message.content.strip()
-                            scene_name = f"Scene from {episode_title}"
-                            
-                            yield f"data: {scene_name}: {scene_description}\n\n"
-                            await asyncio.sleep(0.1)
-                            
-                            # Try to generate a real image
-                            try:
-                                print(f"========== FALLBACK SCENE IMAGE GENERATION: {scene_name} ==========")
-                                print(f"Scene description: {scene_description}")
-                                print(f"Calling generate_flux_image for fallback scene")
-                                image_url, _ = generate_flux_image(scene_description)
+                        # Format the AD agent response as markdown
+                        if is_specific_scene:
+                            # For specific scene request, only show that scene
+                            scene_key = f"episode_{episode_number}"
+                            if hasattr(updated_state, "ad_images") and scene_key in updated_state.ad_images:
+                                ep_title = f"Episode {episode_number}, Scene {scene_number}"
+                                response_text += f"## Scene from {ep_title}\n\n"
+                                response_text += f"![Scene from {ep_title}]({updated_state.ad_images[scene_key]})\n\n"
                                 
-                                if not image_url:
-                                    # Try direct API call as second fallback
-                                    try:
-                                        output = replicate.run(
-                                            "black-forest-labs/flux-1.1-pro",
-                                            input={
-                                                "prompt": scene_description,
-                                                "aspect_ratio": "9:16",
-                                                "output_format": "jpg"
-                                            }
-                                        )
-                                        
-                                        if isinstance(output, list) and len(output) > 0:
-                                            image_url = str(output[0])
-                                        elif isinstance(output, str):
-                                            image_url = output
-                                        else:
-                                            raise Exception("Unexpected output format")
-                                    except Exception as api_err:
-                                        print(f"❌ Direct API call failed: {api_err}")
-                                        # Final fallback to placeholder
-                                        image_url = f"https://placehold.co/600x400/png?text={episode_title.replace(' ', '+')}"
-                            except Exception as img_err:
-                                print(f"❌ Image generation failed in fallback: {img_err}")
-                                # Use placeholder as last resort
-                                image_url = f"https://placehold.co/600x400/png?text={episode_title.replace(' ', '+')}"
-                                
-                            # Send the image URL
-                            yield f"data: IMAGE_URL:{scene_name}:{image_url}\n\n"
-                            await asyncio.sleep(0.1)
-                            
-                            # Save this image to state
-                            if not hasattr(state, 'ad_images'):
-                                state.ad_images = {}
-                            state.ad_images[f"fallback_episode{i+1}"] = image_url
-                            
-                        # Save the updated state
+                                if hasattr(updated_state, "ad_prompts") and scene_key in updated_state.ad_prompts:
+                                    response_text += updated_state.ad_prompts[scene_key] + "\n\n"
+                        else:
+                            # For general request, show multiple episodes/scenes
+                            episode_count = min(len(state.episodes), 3) if state.episodes else 0
+                            for j in range(episode_count):
+                                if j < len(state.episodes):  # Ensure we don't go out of bounds
+                                    ep = state.episodes[j]
+                                    ep_title = ep.get("episode_title", f"Episode {j+1}")
+                                    scene_key = f"episode_{j+1}"
+                                    
+                                    if hasattr(updated_state, "ad_images") and scene_key in updated_state.ad_images:
+                                        response_text += f"## Scene from {ep_title}\n\n"
+                                        response_text += f"![Scene from {ep_title}]({updated_state.ad_images[scene_key]})\n\n"
+                                    
+                                    if hasattr(updated_state, "ad_prompts") and scene_key in updated_state.ad_prompts:
+                                        response_text += updated_state.ad_prompts[scene_key] + "\n\n"
+                    except Exception as e:
+                        print(f"Error calling AD agent: {e}")
+                        response_text += f"Error generating scene visualizations: {str(e)}\n\n"
+                        updated_state = state  # Use original state if there's an error
+                        
+                        # Save updated state to the database
                         try:
                             projects.update_one(
                                 {"session_id": session_id},
-                                {"$set": {"story_data": state.dict(), "updated_at": datetime.utcnow()}}
+                                {"$set": {
+                                    "story_data": updated_state.model_dump(),
+                                    "updated_at": datetime.utcnow()
+                                }}
                             )
-                            print(f"✅ Updated state in database with fallback scene images")
+                            print(f"Updated state in database with scene images")
                         except Exception as db_err:
-                            print(f"❌ Failed to update database in fallback: {str(db_err)}")
+                            print(f"Database update error: {db_err}")
+                            
+                        return response_text
                     else:
-                        yield f"data: Error generating scene images: {str(e)}\n\n"
+                        # No episodes to generate scene images from
+                        return "No episodes found to generate scene visualizations. Please create a story outline first."
+            else:
+                # Use existing scenes to generate images
+                if is_specific_scene:
+                    print(f"Calling AD agent with specific scene request: episode {episode_number}, scene {scene_number}")
+                    # Check if we have a seed to pass
+                    scene_key = f"episode_{episode_number}_scene_{scene_number}"
+                    if hasattr(state, "scene_seeds") and scene_key in state.scene_seeds:
+                        seed_value = state.scene_seeds[scene_key]
+                        print(f"Passing existing seed {seed_value} for consistent imagery")
+                        updated_state = ad_agent(state, episode_number=episode_number, scene_number=scene_number, seed=seed_value)
+                    else:
+                        updated_state = ad_agent(state, episode_number=episode_number, scene_number=scene_number)
+                        # Check if a seed was generated and save it
+                        if hasattr(updated_state, "ad_images") and scene_key in updated_state.ad_images:
+                            # Save the seed if it was returned
+                            if not hasattr(updated_state, "scene_seeds"):
+                                updated_state.scene_seeds = {}
+                            if hasattr(updated_state, "last_generated_seed") and updated_state.last_generated_seed:
+                                updated_state.scene_seeds[scene_key] = updated_state.last_generated_seed
+                                print(f"Saved new seed {updated_state.last_generated_seed} for {scene_key}")
+                else:
+                    updated_state = ad_agent(state)
+                
+                # Format response as markdown
+                response_text = "# Scene Visualizations\n\n"
+                
+                # Add existing scene images if available
+                if is_specific_scene:
+                    # For specific scene request, only show that scene
+                    scene_key = f"episode_{episode_number}_scene_{scene_number}"
+                    if hasattr(updated_state, "ad_images") and scene_key in updated_state.ad_images:
+                        scene_title = f"Episode {episode_number}, Scene {scene_number}"
+                        response_text += f"## {scene_title}\n\n"
+                        response_text += f"![{scene_title}]({updated_state.ad_images[scene_key]})\n\n"
+                        
+                        if scene_key in updated_state.ad_prompts:
+                            response_text += updated_state.ad_prompts[scene_key] + "\n\n"
+                else:
+                    # Show all available scene images
+                    for scene_key, image_url in updated_state.ad_images.items():
+                        scene_title = scene_key.replace("_", " ").title()
+                        response_text += f"## {scene_title}\n\n"
+                        response_text += f"![{scene_title}]({image_url})\n\n"
+                        
+                        if scene_key in updated_state.ad_prompts:
+                            response_text += updated_state.ad_prompts[scene_key] + "\n\n"
+                
+                return response_text
+        
+        # For Writer agent and other agents
         else:
-            # Extract the profile if it's a Writer
+            # Handle different agent types
+            agent_name = agent_to_run
             profile_key = "english_romantic"
+            
             if "::" in agent_to_run:
-                agent_parts = agent_to_run.split("::")
-                if len(agent_parts) >= 2:
-                    agent_to_run = agent_parts[0]
-                    profile_key = agent_parts[1]
-
-            print(f"Using agent {agent_to_run} with profile {profile_key}")
+                agent_name, profile_key = agent_to_run.split("::")
             
-            # Generate the prompt based on the agent and state
-            prompt = generate_agent_prompt(state, agent_to_run, user_message, profile_key)
-            print(f"Generated prompt: {prompt[:100]}...")  # Print first 100 chars of prompt for debugging
+            # Get the agent function
+            agent_fn = agent_map.get(agent_name)
             
-            # Direct OpenAI streaming call
-            try:
-                import re
-                # Use legacy completions format for streaming simplicity
-                response = openai_client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.8,
-                    stream=True,
-                )
+            if not agent_fn:
+                return f"Error: Agent {agent_name} not found."
+            
+            # Call the agent function with appropriate arguments
+            if agent_name == "Writer":
+                updated_state = agent_fn(state, user_message, profile_key)
+            else:
+                updated_state = agent_fn(state)
+            
+            # Process agent response based on agent type
+            if agent_name == "Writer":
+                # Format Writer agent response as markdown
+                # Only display the title without extra headers
+                response_text = f"# {updated_state.title}\n\n"
                 
-                # Buffer to accumulate chunks for more natural word grouping
-                buffer = ""
-                full_response = ""
-                stop_streaming = False
+                if updated_state.episodes and not updated_state.episode_scripts and not updated_state.scene_scripts:
+                    # Series overview - but skip the title and logline headers since we already included the title
+                    if updated_state.characters:
+                        response_text += "## Characters\n\n"
+                        for char in updated_state.characters:
+                            response_text += f"- {char}\n"
+                        response_text += "\n"
+                    
+                    response_text += "## Episodes\n\n"
+                    for ep in updated_state.episodes:
+                        ep_num = ep.get("episode_number", 0)
+                        ep_title = ep.get("episode_title", f"Episode {ep_num}")
+                        ep_summary = ep.get("summary", "No summary available")
+                        
+                        response_text += f"### Episode {ep_num}: {ep_title}\n\n"
+                        response_text += f"{ep_summary}\n\n"
                 
-                # Stream the response chunks
-                for chunk in response:
-                    # Extract the content from the chunk
-                    if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        buffer += content
-                        full_response += content
-                        
-                        # If we already hit the JSON section, just accumulate for DB but don't stream
-                        if stop_streaming:
-                            continue
-                        
-                        # Check if we're entering the JSON section (don't stream this to frontend)
-                        if "```json" in buffer:
-                            # Send whatever is before ```json
-                            parts = buffer.split("```json", 1)
-                            if parts[0].strip():
-                                yield f"data: {parts[0]}\n\n"
-                                await asyncio.sleep(0.01)
+                elif updated_state.episode_scripts:
+                    # Episode scenes
+                    response_text += "## Episode Scenes\n\n"
+                    
+                    # Check if we have the new structured format
+                    if hasattr(updated_state, "structured_scenes") and updated_state.structured_scenes:
+                        for ep_num, scenes in updated_state.structured_scenes.items():
+                            response_text += f"### Episode {ep_num}\n\n"
                             
-                            # Clear buffer and set flag to stop streaming to frontend
-                            buffer = ""
-                            stop_streaming = True
-                            continue
-                        
-                        # Improved buffering - send on natural breakpoints or when buffer gets large
-                        # Preserve spaces by avoiding breaking at most spaces
-                        should_send = False
-                        
-                        # Send on sentence endings and punctuation
-                        if re.search(r'[.!?,;:]', buffer):
-                            should_send = True
-                        
-                        # Send on newlines and paragraph breaks
-                        elif re.search(r'[\n\r]', buffer):
-                            should_send = True
-                        
-                        # Send on markdown headers
-                        elif re.search(r'#+\s', buffer):
-                            should_send = True
-                            
-                        # Send on list items
-                        elif re.search(r'^-\s', buffer.strip()):
-                            should_send = True
-                            
-                        # Send if buffer is getting too large, but try to break at a good point
-                        elif len(buffer) > 80:
-                            # Try to find a good breakpoint within the last part of the buffer
-                            last_part = buffer[-20:]
-                            space_match = re.search(r'\s', last_part)
-                            
-                            if space_match:
-                                # Break at a space if we can find one in the last part
-                                break_pos = len(buffer) - 20 + space_match.start()
-                                to_send = buffer[:break_pos].strip()
+                            for scene in scenes:
+                                scene_num = scene.get("scene_number", 0)
+                                scene_title = scene.get("title", f"Scene {scene_num}")
+                                scene_description = scene.get("description", "")
                                 
-                                if to_send:
-                                    yield f"data: {to_send}\n\n"
-                                    buffer = buffer[break_pos:]
-                                    await asyncio.sleep(0.01)
-                                continue
-                            else:
-                                should_send = True
-                        
-                        if should_send and buffer.strip():
-                            # Add explicit newlines for Markdown headers and list items
-                            if re.search(r'^#+\s', buffer.strip()) or re.search(r'^-\s', buffer.strip()):
-                                # Ensure headers start on a new line
-                                yield f"data: \n{buffer}\n\n"
-                            else:
-                                yield f"data: {buffer}\n\n"
-                            # Small delay to make it feel natural
-                            await asyncio.sleep(0.01)
-                            buffer = ""
+                                # Remove the redundant "Scene X:" prefix if it exists
+                                scene_prefix_pattern = re.match(r'^Scene\s*\d+\s*:\s*(.*)', scene_description, re.IGNORECASE)
+                                if scene_prefix_pattern:
+                                    scene_description = scene_prefix_pattern.group(1).strip()
+                                
+                                response_text += f"#### Scene {scene_num}: {scene_title}\n\n"
+                                response_text += f"{scene_description}\n\n"
+                    # Fall back to old format if structured scenes not available
+                    else:
+                        for ep_num, scenes in updated_state.episode_scripts.items():
+                            response_text += f"### Episode {ep_num}\n\n"
+                            
+                            for i, scene in enumerate(scenes):
+                                response_text += f"#### Scene {i+1}\n\n"
+                                response_text += f"{scene}\n\n"
                 
-                # Send any remaining content in buffer (but not if we're in JSON section)
-                if buffer.strip() and not stop_streaming:
-                    yield f"data: {buffer}\n\n"
-                
-                # Update the state with the generated content (simplified for now)
-                if full_response:
-                    print(f"Full response generated: {len(full_response)} characters")
+                elif updated_state.scene_scripts:
+                    # Scene details
+                    response_text += "## Scene Breakdown\n\n"
                     
-                    # Look for JSON data that might be enclosed in ```json ``` blocks
-                    json_data = None
-                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```', full_response)
-                    
-                    if json_match:
-                        try:
-                            json_text = json_match.group(1).strip()
-                            print(f"Found JSON block ({len(json_text)} chars)")
-                            json_data = json.loads(json_text)
-                            print(f"Successfully parsed JSON from code block")
-                            
-                            # New: Print the full JSON for backend debugging
-                            print("\n====== STRUCTURED JSON DATA (FOR BACKEND DEVS) ======")
-                            print(json.dumps(json_data, indent=2))
-                            print("=====================================================\n")
-                            
-                            # Process JSON data if found
-                            if isinstance(json_data, dict):
-                                # Store the complete structured data directly
-                                # This is our primary source of data now
-
-                                # For series data
-                                if "series_title" in json_data:
-                                    state.title = json_data.get("series_title", state.title)
-                                if "logline" in json_data:
-                                    state.logline = json_data.get("logline", state.logline)
-                                if "characters" in json_data:
-                                    # Use the structured character objects directly
-                                    structured_characters = json_data.get("characters", [])
-                                    # Still convert to strings for backward compatibility
-                                    state.characters = [
-                                        f"{char.get('name', 'Character')}: {char.get('description', '')}"
-                                        for char in structured_characters
-                                    ]
-                                    # Store the original structured data as well
-                                    state.structured_characters = structured_characters
-                                if "episodes" in json_data:
-                                    # Use properly structured episode data directly
-                                    print(f"Saving {len(json_data['episodes'])} episodes to StoryState")
-                                    state.episodes = json_data.get("episodes", [])
-                                    # Log the first episode title to verify
-                                    if len(state.episodes) > 0:
-                                        first_ep = state.episodes[0]
-                                        print(f"First episode in state: {first_ep.get('episode_title', 'No Title')}")
-                                else:
-                                    print("No episodes found in JSON data to add to StoryState")
-                                
-                                # For episode data
-                                if "episode_title" in json_data and "scenes" in json_data:
-                                    episode_num = json_data.get("episode_number", 1)
-                                    # Store the scene data in the episode_scripts
-                                    if not state.episode_scripts:
-                                        state.episode_scripts = {}
-                                    state.episode_scripts[episode_num] = json_data.get("scenes", [])
-                                
-                                # For scene data
-                                if "scene_title" in json_data and "shots" in json_data:
-                                    # Store the shot data in the scene_scripts
-                                    if not state.scene_scripts:
-                                        state.scene_scripts = {}
-                                    scene_key = json_data.get("scene_title", "scene_1")
-                                    state.scene_scripts[scene_key] = json_data.get("shots", [])
-                                
-                                # Store the complete JSON data for reference
-                                if not hasattr(state, "structured_data"):
-                                    state.structured_data = {}
-                                state.structured_data[f"response_{datetime.utcnow().isoformat()}"] = json_data
-                        except json.JSONDecodeError as e:
-                            print(f"Error parsing JSON from code block: {e}")
-                            json_data = None
-                    
-                    # Only try to parse as JSON if it explicitly looks like valid JSON and we didn't already find a JSON block
-                    if not json_data and ((full_response.strip().startswith('{') and full_response.strip().endswith('}')) or (full_response.strip().startswith('[') and full_response.strip().endswith(']'))):
-                        try:
-                            json_data = json.loads(full_response)
-                            # Only process JSON if it has the expected structure
-                            if isinstance(json_data, dict) and ("series_title" in json_data or "episodes" in json_data):
-                                # Looks like a series synopsis
-                                state.title = json_data.get("series_title", state.title)
-                                state.logline = json_data.get("logline", state.logline)
-                                if "characters" in json_data:
-                                    state.characters = json_data.get("characters", [])
-                                if "episodes" in json_data:
-                                    state.episodes = json_data.get("episodes", [])
-                        except json.JSONDecodeError:
-                            # Not valid JSON, just use as raw text
-                            json_data = None
-                    
-                    # If using Markdown output and we couldn't parse as JSON, try to extract key information from the Markdown
-                    if not json_data and agent_to_run == "Writer" and "# " in full_response:
-                        try:
-                            # Try to extract series title (first h1 heading)
-                            title_match = re.search(r'# (.*)', full_response)
-                            if title_match:
-                                state.title = title_match.group(1).strip()
-                            
-                            # Try to extract logline (text after title, before next heading)
-                            if title_match:
-                                title_pos = title_match.start()
-                                next_heading = full_response.find('#', title_pos + 1)
-                                if next_heading > -1:
-                                    logline = full_response[title_pos + len(title_match.group(0)):next_heading].strip()
-                                    if logline:
-                                        state.logline = logline
-                            
-                            # Try to extract characters
-                            characters_section = re.search(r'## Characters(.*?)(?=^##|\Z)', full_response, re.MULTILINE | re.DOTALL)
-                            if characters_section:
-                                character_lines = re.findall(r'- (.*)', characters_section.group(1))
-                                if character_lines:
-                                    state.characters = character_lines
-                            
-                            # Try to extract episodes
-                            episodes = []
-                            episode_sections = re.finditer(r'### Episode \d+: (.*?)\n(.*?)(?=^###|\Z)', full_response, re.MULTILINE | re.DOTALL)
-                            for match in episode_sections:
-                                episode_title = match.group(1).strip()
-                                episode_summary = match.group(2).strip()
-                                episodes.append({
-                                    "episode_title": episode_title,
-                                    "summary": episode_summary
-                                })
-                            
-                            if episodes:
-                                state.episodes = episodes
-                                
-                        except Exception as parse_err:
-                            print(f"Error parsing Markdown content: {parse_err}")
-                    
-                    # Generate suggestions based on the conversation
-                    try:
-                        # Import the generate_chat_suggestions from project_api if it exists there
-                        from api.project_api import generate_chat_suggestions as get_suggestions
-                        suggestions = await get_suggestions(session_id)
-                    except (ImportError, NameError):
-                        # Fallback to hard-coded suggestions if function not available
-                        print("Couldn't import generate_chat_suggestions, using fallback suggestions")
-                        if agent_to_run == "Writer":
-                            suggestions = ["Develop the story further", "Create character backgrounds", "Add conflict"]
-                        elif agent_to_run == "Casting":
-                            suggestions = ["Cast main character", "Design character visuals", "Create character relationships"]
-                        elif agent_to_run == "Director":
-                            suggestions = ["Design a scene", "Set the visual tone", "Plan camera shots"]
+                    for scene_key, shots in updated_state.scene_scripts.items():
+                        match = re.match(r'ep(\d+)_scene(\d+)', scene_key)
+                        if match:
+                            ep_num, scene_num = match.groups()
+                            response_text += f"### Episode {ep_num}, Scene {scene_num}\n\n"
                         else:
-                            suggestions = ["Tell me more", "Create a new episode", "Add details"]
-                    
-                    # Send suggestions as a special message
-                    if suggestions:
-                        suggestions_json = json.dumps(suggestions)
-                        yield f"data: SUGGESTIONS: {suggestions_json}\n\n"
-                        await asyncio.sleep(0.05)
-                    
-                    # Save the updated state to the database
-                    try:
-                        projects.update_one(
-                            {"session_id": session_id},
-                            {"$set": {"story_data": state.dict(), "updated_at": datetime.utcnow()}}
-                        )
-                        print(f"✅ State updated in database for session {session_id}")
-                    except Exception as db_err:
-                        print(f"❌ Failed to update database: {str(db_err)}")
-                
-            except Exception as openai_err:
-                print(f"❌ OpenAI streaming error: {str(openai_err)}")
-                yield f"data: Error with OpenAI streaming: {str(openai_err)}\n\n"
+                            response_text += f"### {scene_key}\n\n"
+                        
+                        for i, shot in enumerate(shots):
+                            response_text += f"#### Shot {i+1}\n\n"
+                            
+                            if "shot" in shot:
+                                response_text += f"**Visual:** {shot['shot']}\n\n"
+                            
+                            if "dialogue" in shot:
+                                response_text += f"**Dialogue:** {shot['dialogue']}\n\n"
+                else:
+                    # Default response for other cases
+                    if hasattr(updated_state, 'last_agent_output') and updated_state.last_agent_output:
+                        response_text += updated_state.last_agent_output
+                    else:
+                        response_text += f"The {agent_name} agent has processed your request.\n\n"
+            
+            # Save updated state to the database
+            try:
+                projects.update_one(
+                    {"session_id": session_id},
+                    {"$set": {
+                        "story_data": updated_state.model_dump(),
+                        "updated_at": datetime.utcnow()
+                    }},
+                    upsert=True
+                )
+                print(f"Updated state saved to database for {agent_name} agent")
+            except Exception as db_err:
+                print(f"Database update error: {db_err}")
+            
+            return response_text
 
     except Exception as e:
-        error_message = str(e)
-        print(f"Error in run_producer_stream: {error_message}")
-        yield f"data: Error: {error_message}\n\n"
-
-    # Signal completion
-    yield "data: [DONE]\n\n"
-
-def generate_agent_prompt(state: StoryState, agent_type: str, user_message: str, profile_key: str = "english_romantic") -> str:
-    print(f"Generating prompt for agent type: {agent_type}")
-    
-    if agent_type == "Writer":
-        # Load writer profile properties
-        try:
-            from agents.writer import load_writer_profile
-            profile = load_writer_profile(profile_key)
-            system_prompt = profile["system_prompt"]
-            language = profile["language"]
-            tone = profile["tone"]
-            style = profile["style_note"]
-            genre = profile["genre"]
-        except Exception as e:
-            print(f"Error loading writer profile: {e}")
-            system_prompt = "You are a creative AI writer."
-            language = "English"
-            tone = "Dramatic"
-            style = "Modern"
-            genre = "Drama"
-            
-        # Check if we need to generate series, episode, or scene
-        if "scene" in user_message.lower():
-            # Logic for scene generation
-            nums = [int(s) for s in user_message.split() if s.isdigit()]
-            
-            if len(nums) == 1:
-                episode_number = 1
-                scene_number = nums[0]
-            elif len(nums) >= 2:
-                episode_number, scene_number = nums[0], nums[1]
-            else:
-                episode_number, scene_number = 1, 1
-                
-            scene_list = state.episode_scripts.get(episode_number, [])
-            if scene_number <= len(scene_list) and scene_number >= 1:
-                scene_text = scene_list[scene_number - 1]
-                
-                return f"""
-{system_prompt}
-
-Break this scene into cinematic shots:
-only 1-2 characters per shot
-Scene: {scene_text}
-
-PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
-
-FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN using these guidelines:
-1. Use proper line breaks between sections
-2. Start with a clear title as a level 1 heading
-3. Use level 2 headings for shot descriptions
-4. Make your content visually clear and well-formatted
-
-FORMAT 2 (FOR STORAGE): STRUCTURED JSON
-After your markdown response, include a JSON object with all the same information in structured format:
-
-```json
-{{
-  "scene_title": "Title of the scene",
-  "shots": [
-    {{
-      "shot_number": 1,
-      "description": "Description of shot 1",
-      "dialogue": "Any dialogue in this shot",
-      "characters": ["Character1", "Character2"]
-    }},
-    {{
-      "shot_number": 2,
-      "description": "Description of shot 2",
-      "dialogue": "Any dialogue in this shot",
-      "characters": ["Character1"]
-    }}
-  ]
-}}
-```
-
-Start with the markdown content, then add the JSON at the end after all the markdown content is complete.
-"""
-            else:
-                return f"Error: Scene {scene_number} does not exist in Episode {episode_number}."
-            
-        elif "episode" in user_message.lower():
-            # Logic for episode generation
-            episode_number = 1
-            for s in user_message.split():
-                if s.isdigit():
-                    episode_number = int(s)
-                    break
-                    
-            if 0 < episode_number <= len(state.episodes):
-                episode = state.episodes[episode_number - 1]
-                title = episode["episode_title"]
-                summary = episode["summary"]
-
-                return f"""
-{system_prompt}
-
-Break this episode into 6-8 scenes.
-only 1-2 characters per scene
-Title: {title}
-Summary: {summary}
-
-PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
-
-FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN using these guidelines:
-1. Use proper line breaks between sections
-2. Start with a clear title as a level 1 heading
-3. Use level 2 headings for scene descriptions
-4. Make your content visually clear and well-formatted
-
-FORMAT 2 (FOR STORAGE): STRUCTURED JSON
-After your markdown response, include a JSON object with all the same information in structured format:
-
-```json
-{{
-  "episode_title": "{title}",
-  "episode_number": {episode_number},
-  "scenes": [
-    {{
-      "scene_number": 1,
-      "description": "Description of scene 1",
-      "setting": "Location of scene 1",
-      "characters": ["Character1", "Character2"]
-    }},
-    {{
-      "scene_number": 2,
-      "description": "Description of scene 2",
-      "setting": "Location of scene 2",
-      "characters": ["Character1"]
-    }}
-  ]
-}}
-```
-
-Start with the markdown content, then add the JSON at the end after all the markdown content is complete.
-"""
-            else:
-                return f"Error: Episode {episode_number} does not exist."
-                
-        else:
-            # Series synopsis generation
-            return f"""
-{system_prompt}
-
-Language: {language}
-Genre: {genre}
-Tone: {tone}
-Style Guide: {style}
-Instructions:- 
-"Only 2-3 characters per episode",
-"Only 1-2 locations per episode",
-Write a 10-episode series synopsis:
-"{user_message}"
-
-PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
-
-FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN using these guidelines:
-1. Use proper line breaks between sections
-2. Start with a clear title as a level 1 heading (# Title)
-3. Put one blank line between the title and the logline
-4. Use level 2 headings (## Heading) for main sections
-5. Use bullet points with proper formatting (- Item)
-6. Use level 3 headings (### Heading) for episode titles
-7. Each section must be on its own line with proper spacing
-
-Structure your markdown response precisely as:
-
-# [Series Title]
-
-[Series Logline]
-
-## Characters
-
-- Character 1: Brief description
-- Character 2: Brief description
-
-## Episodes
-
-### Episode 1: [Title]
-
-[Episode summary]
-
-### Episode 2: [Title]
-
-[Episode summary]
-
-FORMAT 2 (FOR STORAGE): STRUCTURED JSON
-After your markdown response, include a JSON object with all the same information:
-
-```json
-{{
-  "series_title": "Title of the series",
-  "logline": "One-sentence description of the series",
-  "characters": [
-    {{
-      "name": "Character 1", 
-      "description": "Brief description"
-    }},
-    {{
-      "name": "Character 2", 
-      "description": "Brief description"
-    }}
-  ],
-  "episodes": [
-    {{
-      "episode_number": 1,
-      "episode_title": "Title of episode 1",
-      "summary": "Summary of episode 1"
-    }},
-    {{
-      "episode_number": 2,
-      "episode_title": "Title of episode 2",
-      "summary": "Summary of episode 2"
-    }}
-  ]
-}}
-```
-
-Start with the markdown content for human reading, then add the JSON at the end for machine processing.
-"""
-                
-    # Add prompts for other agent types here
-    # For now, let's just create a simple fallback
-    return f"""
-You are an AI helping create a movie or TV show.
-
-Current title: {state.title}
-Current logline: {state.logline}
-Number of episodes: {len(state.episodes)}
-
-User request: {user_message}
-
-PROVIDE YOUR RESPONSE IN TWO FORMATS - FIRST MARKDOWN FOR DISPLAY, THEN JSON FOR STORAGE:
-
-FORMAT 1 (FOR DISPLAY): PROPER, CLEAN MARKDOWN, with:
-- Clear headings (use # for main heading, ## for subheadings)
-- Line breaks between paragraphs
-- Proper bullet points where appropriate
-- Numbered lists where sequence matters
-- Clear formatting for emphasis
-
-FORMAT 2 (FOR STORAGE): STRUCTURED JSON
-After your markdown response, include a JSON object with your content in structured format:
-
-```json
-{{
-  "title": "Title if relevant",
-  "content_type": "What kind of content this is (feedback, idea, etc.)",
-  "main_points": [
-    "First main point",
-    "Second main point"
-  ],
-  "details": "Any additional structured data relevant to your response"
-}}
-```
-
-Start with the markdown content for display, then add the JSON at the end for data storage.
-"""
+        print(f"Error in run_producer_stream: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return f"Error processing request: {str(e)}"
 
 @log_entry_exit
 def run_engine(state: StoryState, user_message: str):
@@ -1012,3 +467,77 @@ def run_engine(state: StoryState, user_message: str):
     updated_state = agent_map[agent_to_run](state)
     
     return updated_state, agent_to_run
+
+def ensure_state_attributes(state: StoryState) -> StoryState:
+    """Ensure all StoryState attributes are properly initialized to avoid None errors"""
+    # User context
+    if not hasattr(state, "user_prompt") or state.user_prompt is None:
+        state.user_prompt = ""
+    if not hasattr(state, "story_prompt") or state.story_prompt is None:
+        state.story_prompt = ""
+    if not hasattr(state, "producer_notes") or state.producer_notes is None:
+        state.producer_notes = ""
+    if not hasattr(state, "session_memory") or state.session_memory is None:
+        state.session_memory = []
+    if not hasattr(state, "last_agent_output") or state.last_agent_output is None:
+        state.last_agent_output = None
+    if not hasattr(state, "ad_prompts") or state.ad_prompts is None:
+        state.ad_prompts = {}
+    if not hasattr(state, "ad_images") or state.ad_images is None:
+        state.ad_images = {}
+    if not hasattr(state, "ad_character_info") or state.ad_character_info is None:
+        state.ad_character_info = {}
+
+    # High-level metadata
+    if not hasattr(state, "title") or state.title is None:
+        state.title = ""
+    if not hasattr(state, "logline") or state.logline is None:
+        state.logline = ""
+    if not hasattr(state, "genre") or state.genre is None:
+        state.genre = ""
+    if not hasattr(state, "style") or state.style is None:
+        state.style = ""
+    if not hasattr(state, "writer_profile") or state.writer_profile is None:
+        state.writer_profile = ""
+
+    # Characters
+    if not hasattr(state, "characters") or state.characters is None:
+        state.characters = []
+    if not hasattr(state, "character_map") or state.character_map is None:
+        state.character_map = {}
+    if not hasattr(state, "character_profiles") or state.character_profiles is None:
+        state.character_profiles = []
+    if not hasattr(state, "structured_characters") or state.structured_characters is None:
+        state.structured_characters = []
+
+    # Series Structure
+    if not hasattr(state, "script_outline") or state.script_outline is None:
+        state.script_outline = ""
+    if not hasattr(state, "three_act_structure") or state.three_act_structure is None:
+        state.three_act_structure = {}
+
+    # Episode-level story
+    if not hasattr(state, "episodes") or state.episodes is None:
+        state.episodes = []
+    if not hasattr(state, "episode_scripts") or state.episode_scripts is None:
+        state.episode_scripts = {}
+    if not hasattr(state, "scene_scripts") or state.scene_scripts is None:
+        state.scene_scripts = {}
+    if not hasattr(state, "structured_scenes") or state.structured_scenes is None:
+        state.structured_scenes = {}
+
+    # Visual Assets
+    if not hasattr(state, "scenes") or state.scenes is None:
+        state.scenes = []
+    if not hasattr(state, "scene_image_prompts") or state.scene_image_prompts is None:
+        state.scene_image_prompts = []
+    if not hasattr(state, "video_clips") or state.video_clips is None:
+        state.video_clips = []
+    if not hasattr(state, "session_id") or state.session_id is None:
+        state.session_id = ""
+
+    # Structured Data Storage
+    if not hasattr(state, "structured_data") or state.structured_data is None:
+        state.structured_data = {}
+
+    return state

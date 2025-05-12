@@ -11,6 +11,7 @@ class StoryState(BaseModel):
     ad_prompts: Dict[str, str] = {}
     ad_images: Dict[str, str] = {}
     ad_character_info: Dict[str, Dict[str, Any]] = {}  # Stores character info for each shot
+    scene_seeds: Dict[str, int] = {}  # Stores seeds for scene images
 
 
     # High-level metadata
@@ -33,8 +34,11 @@ class StoryState(BaseModel):
 
     # Episode-level story
     episodes: List[Dict[str, Any]] = []              # [{episode_title, summary}]
-    episode_scripts: Dict[int, List[str]] = {}        # episode_num → scene descriptions
+    episode_scripts: Dict[str, List[str]] = {}       # episode_num → scene descriptions (OLD FORMAT)
     scene_scripts: Dict[str, List[Dict[str, str]]] = {}  # "ep1_scene2" → [{shot, dialogue}]
+    
+    # New structured scene format
+    structured_scenes: Dict[str, List[Dict[str, Any]]] = {}  # episode_num → [{scene_number, title, description}]
 
     # Visual Assets
     scenes: List[str] = []                         # fallback if used in director-only flow
