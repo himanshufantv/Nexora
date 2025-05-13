@@ -4,6 +4,7 @@ from utils.types import StoryState
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
+import json
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -44,7 +45,83 @@ User request:
         print(f"❌ GPT failed to select writer profile: {e}")
         return "english_action"
 
+# Add a helper function to ensure character information is consistent with synopsis
+def ensure_character_consistency(state, user_input):
+    """
+    Ensure character information is consistent with synopsis by extracting 
+    character names from synopsis if needed.
+    
+    Returns:
+        Updated state with character information
+    """
+    try:
+        # Only proceed if we don't have character information but have a synopsis or logline
+        if (not state.characters or len(state.characters) == 0) and (state.logline or state.title):
+            synopsis = state.logline if state.logline else state.title
+            print(f"Ensuring character consistency using synopsis: {synopsis[:50]}...")
+            
+            # Extract character names from synopsis
+            extract_prompt = f"""
+Extract the names of the main characters mentioned in this synopsis. Return ONLY a JSON array of names, nothing else:
+
+{synopsis}
+
+Example: ["Name1", "Name2"]
+"""
+            extract_response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": extract_prompt}],
+                temperature=0.3
+            )
+            
+            char_names_text = extract_response.choices[0].message.content.strip()
+            # Clean up for valid JSON
+            char_names_text = char_names_text.replace("```json", "").replace("```", "").strip()
+            
+            try:
+                char_names = json.loads(char_names_text)
+                print(f"Extracted character names from synopsis: {char_names}")
+                
+                # Generate basic character descriptions
+                desc_prompt = f"""
+Create basic character descriptions for these characters from the synopsis:
+{", ".join(char_names)}
+
+Synopsis: {synopsis}
+
+For each character, provide their name followed by a brief description.
+Format each as: "Character Name, brief description"
+"""
+                desc_response = client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": desc_prompt}],
+                    temperature=0.7
+                )
+                
+                char_descriptions = desc_response.choices[0].message.content.strip().split("\n")
+                # Filter out empty lines and quotes
+                char_descriptions = [desc.strip(' "\'') for desc in char_descriptions if desc.strip()]
+                
+                # Add these characters to the state
+                if not hasattr(state, "characters"):
+                    state.characters = []
+                    
+                for desc in char_descriptions:
+                    if desc and "," in desc:
+                        state.characters.append(desc)
+                
+                print(f"Added {len(state.characters)} character descriptions to state")
+            except Exception as parse_err:
+                print(f"Error parsing character names: {parse_err}")
+    except Exception as e:
+        print(f"Error ensuring character consistency: {e}")
+    
+    return state
+
 def producer_agent(state: StoryState, user_input: str) -> str:
+
+    # First, ensure character consistency with the synopsis
+    state = ensure_character_consistency(state, user_input)
 
     state_summary = f"""
     Current Story State:
@@ -68,18 +145,30 @@ def producer_agent(state: StoryState, user_input: str) -> str:
         
     # ⛔ AD Keywords — override routing if user wants scene/setting images
     ad_keywords = [
-        "scene images", "visualize scenes", "scene visuals", "generate scene images",
-        "show me what the scene looks like", "create scene visuals", "scene photos",
-        "episode visuals", "visualize episode", "show scenes", "generate visuals",
-        "scene image", "episode image", "show episode", "episode visualization", 
-        "scene visualization", "scene pictures", "episode pictures", "create scene images",
-        "fix scene images", "generate image for scene", "generate scene images",
-        "create visuals", "scene visual", "show me scene", "image for scene",
-        "scene image", "scene", "image"  # Add very generic terms as a fallback
+        "shot image", "image for shot", "visualize shot", "generate shot image",
+        "shots", "generate shots", "create shots", "shot visuals", "shot visualization",
+        "shot pictures", "picture for shot", "image for shot", "show me shot",
+        "show me the shots", "create image for shot", "generate visuals for shot"
     ]
-    if any(keyword in user_input.lower() for keyword in ad_keywords):
-        print("✅ Scene image request detected, routing to AD agent")
+    
+    # Check for more specific shot requests (which should go to AD)
+    shot_image_request = any(keyword in user_input.lower() for keyword in ad_keywords)
+    
+    # Check for scene requests without images (which should go to Writer)
+    scene_keywords = [
+        "create scene", "generate scene", "write scene", "scene for episode",
+        "scene description", "scene breakdown", "scene details", "develop scene"
+    ]
+    scene_without_image_request = any(keyword in user_input.lower() for keyword in scene_keywords) and not shot_image_request
+    
+    if shot_image_request:
+        print("✅ Shot image request detected, routing to AD agent")
         return "AD"
+    
+    if scene_without_image_request:
+        print("✅ Scene description request detected, routing to Writer agent")
+        writer_profile = detect_writer_profile_gpt(user_input)
+        return f"Writer::{writer_profile}"
         
     # ⛔ VideoDesign Keywords — override routing for video requests
     video_keywords = [

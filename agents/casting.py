@@ -14,18 +14,75 @@ def extract_character_info(raw: str):
     print(f"⚙️ Extracted name: '{name}', description: '{description[:50]}...'")
     return name, description
 
-def extract_info(description: str):
-    """Extract gender, age, nationality roughly from description."""
+def guess_gender_from_name(name):
+    """Try to determine gender based on common name patterns, especially for Indian names."""
+    name = name.lower()
+    
+    # Common Indian male name endings
+    male_endings = ['raj', 'deep', 'esh', 'eet', 'ant', 'ay', 'ul', 'un', 'it', 'ik', 'ev', 'am', 'an']
+    # Common Indian male names
+    male_names = ['aman', 'arjun', 'aarav', 'vikram', 'rahul', 'rohan', 'akash', 'aditya', 'varun', 
+                 'vijay', 'karan', 'nikhil', 'suresh', 'ramesh', 'mahesh', 'rajesh', 'anil', 'sunil']
+    
+    # Common Indian female name endings
+    female_endings = ['i', 'a', 'ee', 'ya', 'na', 'ti', 'ni', 'ma', 'ta', 'vi', 'ha', 'ja']
+    # Common Indian female names
+    female_names = ['kavya', 'naina', 'priya', 'meera', 'neha', 'divya', 'pooja', 'anjali', 'shreya', 
+                   'swati', 'rani', 'sunita', 'anita', 'sarita', 'deepti', 'jyoti', 'sakshi']
+    
+    # Check for exact name matches first
+    if name in male_names:
+        return "male"
+    if name in female_names:
+        return "female"
+    
+    # Then check name endings
+    for ending in male_endings:
+        if name.endswith(ending) and len(name) > len(ending):
+            return "male"
+    
+    for ending in female_endings:
+        if name.endswith(ending) and len(name) > len(ending):
+            return "female"
+    
+    return None
+
+def extract_info(description: str, character_name=None):
+    """Extract gender, age, nationality roughly from description and name."""
     desc = description.lower()
     gender = None
     age = None
     nationality = None
+    
+    # First try to determine gender from character name if provided
+    if character_name:
+        gender = guess_gender_from_name(character_name)
+        if gender:
+            print(f"📊 Determined gender '{gender}' from character name '{character_name}'")
 
-    # More flexible gender detection
-    if any(word in desc for word in ["female", "woman", "girl", "she", "her", "feminine", "lady"]):
-        gender = "female"
-    elif any(word in desc for word in ["male", "man", "boy", "he", "his", "masculine", "guy"]):
-        gender = "male"
+    # Common Indian male and female name patterns and suffixes
+    indian_male_indicators = ["kumar", "singh", "raj", "aman", "arav", "vikram", "arjun", "rohan", "rahul", "suresh", "nikhil", "varun"]
+    indian_female_indicators = ["devi", "kumari", "kaur", "kavya", "naina", "meera", "priya", "neha", "pooja", "anjali", "shreya", "divya"]
+    
+    # Only continue with description-based gender detection if we don't have a gender yet
+    if gender is None:
+        # Check common Indian name patterns in description
+        for indicator in indian_male_indicators:
+            if indicator in desc.split():
+                gender = "male"
+                break
+                
+        for indicator in indian_female_indicators:
+            if indicator in desc.split():
+                gender = "female"
+                break
+                
+        # If no pattern match, use regular keyword detection
+        if gender is None:
+            if any(word in desc for word in ["female", "woman", "girl", "she", "her", "feminine", "lady", "wife", "daughter", "sister"]):
+                gender = "female"
+            elif any(word in desc for word in ["male", "man", "boy", "he", "his", "masculine", "guy", "husband", "son", "brother"]):
+                gender = "male"
     
     # Improved age detection
     age_keywords = {
@@ -41,7 +98,7 @@ def extract_info(description: str):
     # Expanded nationality detection
     nationality_keywords = {
         "american": "american", "usa": "american", "states": "american", "america": "american",
-        "indian": "indian", "india": "indian",
+        "indian": "indian", "india": "indian", "hindi": "indian", "himalayan": "indian", "himalaya": "indian",
         "british": "british", "uk": "british", "england": "british",
     }
     for keyword, value in nationality_keywords.items():
@@ -149,7 +206,7 @@ def casting_agent(state: StoryState) -> StoryState:
 
     for idx, raw in enumerate(characters):
         name, description = extract_character_info(raw)
-        gender, age, nationality = extract_info(description)
+        gender, age, nationality = extract_info(description, name)
         token = f"{token_prefix}-{idx + 1}"
         character_map[name] = token
 
@@ -172,23 +229,39 @@ def casting_agent(state: StoryState) -> StoryState:
 
         print(f"✅ {name} ({token}) matched → {chosen.get('image_url', '')[:30]}... [similarity: {similarity_score:.2f}]")
 
-        # Extract additional details from the chosen candidate
-        hf_lora = chosen.get("hf_lora", "")
-        ethnicity = chosen.get("ethnicity", "")
-        candidate_gender = chosen.get("gender", "")
+        # Store all details from the chosen candidate
         character_profile = {
+            # Character-specific details
             "name": name,
             "token": token,
             "description": description,
+            
+            # Include all fields from the chosen candidate
             "reference_image": chosen.get("image_url"),
             "combined_lora": chosen.get("combined_lora", None),
-            "hf_lora": hf_lora,
-            "ethnicity": ethnicity,
-            "gender": candidate_gender,
+            "hf_lora": chosen.get("hf_lora", ""),
+            "ethnicity": chosen.get("ethnicity", ""),
+            "gender": chosen.get("gender", ""),
+            "age": chosen.get("age", ""),
             "original_id": str(chosen.get("_id", "")),
             "candidate_name": chosen.get("name", ""),
-            "matched_at": datetime.utcnow().isoformat()
+            "matched_at": datetime.utcnow().isoformat(),
+            "candidiate_description": chosen.get("description", ""),
+            "height": chosen.get("height", ""),
+            "weight": chosen.get("weight", ""),
+            "eye_color": chosen.get("eye_color", ""),
+            "hair_color": chosen.get("hair_color", ""),
+            "body_type": chosen.get("body_type", ""),
+            "facial_features": chosen.get("facial_features", ""),
+            "skin_tone": chosen.get("skin_tone", ""),
+            "clothing_style": chosen.get("clothing_style", ""),
+            "personality": chosen.get("personality", ""),
+            "distinguishing_features": chosen.get("distinguishing_features", ""),
+            "background": chosen.get("background", ""),
+            "occupation": chosen.get("occupation", ""),
+            "additional_attributes": chosen.get("additional_attributes", {})
         }
+        
         character_profiles.append(character_profile)
 
     # 🛠 Now apply compatible_with LoRA logic if 2 characters

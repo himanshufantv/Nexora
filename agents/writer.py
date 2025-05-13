@@ -190,13 +190,147 @@ def generate_episode_script(state, user_message, system_prompt):
         import re
         from utils.parser import safe_parse_json_string
         
-        # Ensure state has required attributes
-        if not hasattr(state, "episodes"):
-            state.episodes = []
+        # Check if user is requesting just episodes (without scenes)
+        is_episodes_only_request = "episodes" in user_message.lower() and not "scene" in user_message.lower()
         
-        if not hasattr(state, "episode_scripts"):
-            state.episode_scripts = {}
+        # If this is a general "generate episodes" request, create all 10 episodes
+        if is_episodes_only_request:
+            print(f"Generating all episodes without scenes")
+            
+            # Get synopsis and character information if available to ensure consistency
+            synopsis = state.logline if hasattr(state, "logline") and state.logline else ""
+            
+            # If no synopsis in logline, check title as well
+            if not synopsis and hasattr(state, "title") and state.title:
+                synopsis = state.title
+            
+            # Extract character information from state if available
+            character_info = []
+            if hasattr(state, "characters") and state.characters:
+                character_info = state.characters
+                print(f"Using {len(character_info)} existing characters")
                 
+            # Modify the episodes prompt to include character information
+            character_names = []
+            if character_info:
+                for char in character_info:
+                    if isinstance(char, str) and ',' in char:
+                        name = char.split(',')[0].strip()
+                        character_names.append(name)
+            
+            # If we don't have character names but have a synopsis, try to extract them
+            if not character_names and synopsis:
+                try:
+                    # Try to extract character names from the synopsis
+                    import json
+                    from openai import OpenAI
+                    
+                    extract_prompt = f"""
+Extract the main characters' names from this synopsis. Return ONLY a JSON array of names, nothing else:
+
+{synopsis}
+
+Example: ["Name1", "Name2"]
+"""
+                    extract_response = client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[{"role": "user", "content": extract_prompt}],
+                        temperature=0.3
+                    )
+                    
+                    char_names_text = extract_response.choices[0].message.content.strip()
+                    # Clean up for valid JSON
+                    char_names_text = char_names_text.replace("```json", "").replace("```", "").strip()
+                    try:
+                        character_names = json.loads(char_names_text)
+                        print(f"Extracted character names from synopsis: {character_names}")
+                    except:
+                        # If JSON parsing fails, try a simple split
+                        character_names = [name.strip(' "\'[]') for name in char_names_text.split(",")]
+                except Exception as e:
+                    print(f"Error extracting character names from synopsis: {e}")
+            
+            # Define character constraint if we have character names
+            character_constraint = ""
+            if character_names:
+                character_constraint = f"""
+IMPORTANT: Use ONLY these character names in your episodes: {', '.join(character_names)}
+DO NOT invent or use any other main character names not in this list.
+"""
+            
+            episodes_prompt = f"""
+{system_prompt}
+
+Create a 10-episode series for a dramatic series. For each episode, provide:
+1. The episode number (1-10)
+2. A compelling episode title
+3. A detailed summary (1-2 paragraphs) of what happens in the episode
+
+Synopsis of the story: {synopsis}
+{character_constraint}
+
+Episode summaries should be self-contained but connect to form a cohesive season arc.
+DO NOT include detailed scenes - just the high-level episode summaries.
+
+Return your response in this JSON format:
+{{
+  "episodes": [
+    {{
+      "episode_number": 1,
+      "episode_title": "Title of episode 1",
+      "summary": "Detailed summary of episode 1"
+    }},
+    {{
+      "episode_number": 2,
+      "episode_title": "Title of episode 2",
+      "summary": "Detailed summary of episode 2"
+    }},
+    ...and so on for all 10 episodes
+  ]
+}}
+"""
+
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": episodes_prompt}],
+                temperature=0.7
+            )
+            
+            response_content = response.choices[0].message.content
+            
+            # Extract JSON if in code block
+            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_content)
+            if json_match:
+                episodes_json = json_match.group(1).strip()
+            else:
+                episodes_json = response_content
+                
+            parsed_response = safe_parse_json_string(episodes_json)
+            
+            # Update the episodes in the state
+            if isinstance(parsed_response, dict) and "episodes" in parsed_response:
+                new_episodes = parsed_response["episodes"]
+                
+                # Ensure all episodes have proper episode_number
+                for i, episode in enumerate(new_episodes):
+                    if "episode_number" not in episode:
+                        episode["episode_number"] = i + 1
+                
+                # Update state with all episodes
+                new_state = state.copy(update={
+                    "episodes": new_episodes
+                })
+                
+                # Set the output for downstream processes
+                new_state.last_agent_output = f"# Series Episodes\n\n" + "\n\n".join([
+                    f"## Episode {ep['episode_number']}: {ep['episode_title']}\n\n{ep['summary']}"
+                    for ep in new_episodes
+                ])
+                
+                log_agent_output("Writer", new_state)
+                return new_state
+        
+        # If it's a request for specific episode script with scenes...
         # Try to extract episode number from user message
         episode_digits = "".join(filter(str.isdigit, user_message))
         episode_number = int(episode_digits) if episode_digits else 1
@@ -209,7 +343,7 @@ def generate_episode_script(state, user_message, system_prompt):
             episode_prompt = f"""
 {system_prompt}
 
-Create a detailed episode for a Hindi romantic drama series. 
+Create a detailed episode for a dramatic series. 
 This should be Episode {episode_number}.
 
 Return your response in this JSON format:
@@ -282,6 +416,49 @@ Return your response in this JSON format:
 }}
 """
 
+        # Add character information to the prompt if available
+        character_names = []
+        
+        # Try to extract character information from character_profiles
+        if hasattr(state, "character_profiles") and state.character_profiles:
+            print(f"Found {len(state.character_profiles)} character profiles to use in episode script")
+            for profile in state.character_profiles:
+                name = profile.get("name", "")
+                desc = profile.get("description", "")
+                if name:
+                    character_names.append(name)
+                    scenes_prompt += f"\nCharacter: {name} - {desc[:100]}..."
+        
+        # If no profiles found, try to get from characters list
+        elif hasattr(state, "characters") and state.characters:
+            print(f"Found {len(state.characters)} characters to use in episode script")
+            for char in state.characters:
+                if isinstance(char, str) and ',' in char:
+                    name = char.split(',')[0].strip()
+                    desc = char.split(',', 1)[1].strip() if len(char.split(',')) > 1 else ""
+                    character_names.append(name)
+                    scenes_prompt += f"\nCharacter: {name} - {desc[:100]}..."
+        
+        # Also check for characters in story_data (where API stores them)
+        elif hasattr(state, "story_data") and isinstance(state.story_data, dict) and "character_profiles" in state.story_data:
+            char_profiles = state.story_data["character_profiles"]
+            print(f"Found {len(char_profiles)} character profiles in story_data")
+            for profile in char_profiles:
+                name = profile.get("name", "")
+                desc = profile.get("description", "")
+                if name:
+                    character_names.append(name)
+                    scenes_prompt += f"\nCharacter: {name} - {desc[:100]}..."
+        
+        # If any character names were found, add a constraint to the prompt
+        if character_names:
+            print(f"Using character names in episode script: {', '.join(character_names)}")
+            scenes_prompt += f"""
+
+IMPORTANT: Use ONLY these character names in your scenes: {', '.join(character_names)}
+DO NOT invent or use any other main character names not in this list.
+"""
+
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": scenes_prompt}],
@@ -314,13 +491,17 @@ Return your response in this JSON format:
                 
             # Update both formats
             episode_str = str(episode_number)
+            structured_scenes_dict = {}
+            if hasattr(state, "structured_scenes"):
+                structured_scenes_dict = state.structured_scenes
+                
             new_state = state.copy(update={
                 "episode_scripts": {
                     **state.episode_scripts,
                     episode_str: old_format_scenes  # Old format
                 },
                 "structured_scenes": {
-                    **state.structured_scenes,
+                    **structured_scenes_dict,
                     episode_str: structured_scenes  # New format
                 }
             })
@@ -352,13 +533,17 @@ Return your response in this JSON format:
                 
             # Update both formats
             episode_str = str(episode_number)
+            structured_scenes_dict = {}
+            if hasattr(state, "structured_scenes"):
+                structured_scenes_dict = state.structured_scenes
+                
             new_state = state.copy(update={
                 "episode_scripts": {
                     **state.episode_scripts,
                     episode_str: scenes  # Old format
                 },
                 "structured_scenes": {
-                    **state.structured_scenes,
+                    **structured_scenes_dict,
                     episode_str: structured_scenes  # New format
                 }
             })

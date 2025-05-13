@@ -62,7 +62,7 @@ def get_writer_profiles_collection():
             return None
     except Exception as e:
         print(f"Error accessing writer_profiles collection: {e}")
-        return None
+    return None
 
 def get_db():
     """Return the database object."""
