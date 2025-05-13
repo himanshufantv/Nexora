@@ -544,8 +544,10 @@ Keep your description under 100 words and make it visually rich.
             # Generate the actual image
             if is_specific_request:
                 scene_key = f"episode_{episode_number}_scene_{scene_number}"
+                print(f"🔑 Using specific scene key format: {scene_key}")
             else:
-                scene_key = f"episode{i+1}_main"
+                scene_key = f"episode_{i+1}_main"  # Adding underscore for consistency
+                print(f"🔑 Using general scene key format: {scene_key}")
                 
             ad_prompts[scene_key] = scene_description
             
