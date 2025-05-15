@@ -11,6 +11,9 @@ from utils.replicate_image_gen import generate_flux_image
 from db.models.casting_characters import get_candidate_characters
 from db.models.story_projects import update_story_project_by_session
 
+# First make sure replicate is imported
+import replicate
+
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -565,9 +568,6 @@ Keep your description under 100 words and make it visually rich.
             
             # FORCE IMAGE GENERATION: Use the direct replicate_image_gen without fallbacks
             try:
-                from utils.replicate_image_gen import generate_flux_image
-                import replicate
-                
                 # First try standard flux image generation
                 print(f"========== EPISODE IMAGE GENERATION ==========")
                 print(f"Episode: {episode_title}")

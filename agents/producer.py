@@ -5,11 +5,12 @@ from openai import OpenAI
 import os
 from dotenv import load_dotenv
 import json
+import re
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-VALID_AGENTS = ["Writer", "Director", "Casting", "AD", "VideoDesign", "Editor"]
+VALID_AGENTS = ["Writer", "Director", "Casting", "AD", "VideoDesign", "Editor", "Storyboard"]
 VALID_PROFILES = ["hindi_romantic", "hindi_action", "english_romantic", "english_action"]
 
 def detect_writer_profile_gpt(user_input: str) -> str:
@@ -38,14 +39,14 @@ User request:
         )
         profile = response.choices[0].message.content.strip()
         if profile not in VALID_PROFILES:
-            print(f"⚠️ Invalid profile returned: {profile}. Defaulting to english_romantic.")
-            return "hindi_action"
+            print(f"⚠️ Invalid profile returned: {profile}. Defaulting to hindi_romantic.")
+            return "hindi_romantic"
         return profile
     except Exception as e:
         print(f"❌ GPT failed to select writer profile: {e}")
-        return "english_action"
+        return "hindi_romantic"
 
-# Add a helper function to ensure character information is consistent with synopsis
+# Add the missing ensure_character_consistency function
 def ensure_character_consistency(state, user_input):
     """
     Ensure character information is consistent with synopsis by extracting 
@@ -151,15 +152,29 @@ def producer_agent(state: StoryState, user_input: str) -> str:
         "show me the shots", "create image for shot", "generate visuals for shot"
     ]
     
+    # ⛔ Storyboard Keywords — override routing for detailed scene shots with images
+    storyboard_keywords = [
+        "scene images", "storyboard", "scene storyboard",
+        "visualize scene", "create shots for scene"
+    ]
+    
+    # Check for specific scene creation requests (which should go to Storyboard)
+    scene_match = re.search(r'(create|make|generate)\s+scene\s+(\d+)', user_input.lower())
+    scene_request = bool(scene_match) or any(keyword in user_input.lower() for keyword in storyboard_keywords)
+    
+    if scene_request:
+        print("✅ Scene creation request detected, routing to Storyboard agent")
+        return "Storyboard"
+    
     # Check for more specific shot requests (which should go to AD)
     shot_image_request = any(keyword in user_input.lower() for keyword in ad_keywords)
     
     # Check for scene requests without images (which should go to Writer)
     scene_keywords = [
-        "create scene", "generate scene", "write scene", "scene for episode",
+        "generate scene", "write scene", "scene for episode",
         "scene description", "scene breakdown", "scene details", "develop scene"
     ]
-    scene_without_image_request = any(keyword in user_input.lower() for keyword in scene_keywords) and not shot_image_request
+    scene_without_image_request = any(keyword in user_input.lower() for keyword in scene_keywords) and not shot_image_request and not scene_request
     
     if shot_image_request:
         print("✅ Shot image request detected, routing to AD agent")
@@ -179,16 +194,11 @@ def producer_agent(state: StoryState, user_input: str) -> str:
         print("✅ Video request detected, routing to VideoDesign agent")
         return "VideoDesign"
 
-    print(f"❌ I AM HERE 232343 {state}")
-
     # ✅ Detect profile only if not set
     if isinstance(state, dict) and state.get("writer_profile"):
-        print(f"❌ I AM HERE 232343")
         writer_profile = state.writer_profile
     else:
-        print(f"❌ I AM HERE 32434234")
         writer_profile = detect_writer_profile_gpt(user_input)
-        print(f"❌ I AM HERE 324342342324324 {writer_profile}")
         
     # 🎬 Ask GPT which agent to use
     prompt = f"""
@@ -197,7 +207,7 @@ You are the Producer Agent in a multi-agent AI filmmaking pipeline.
 Based on the current state and user input, choose the next AGENT to run.
 
 Available agents:
-Writer, Director, Casting, AD, VideoDesign, Editor
+Writer, Director, Casting, AD, VideoDesign, Editor, Storyboard
 
 Guidance:
 - If the user asks about story, script, plot, episode, or scene → return Writer
@@ -211,7 +221,6 @@ User Message:
 """
 
     try:
-        print(f"❌ I AM HERE write {state_summary}")
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
