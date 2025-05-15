@@ -46,5 +46,8 @@ class StoryState(BaseModel):
     video_clips: List[str] = []           
     session_id: str = ""         # Kling video URLs
     
+    # Storyboard data
+    storyboard: List[Dict[str, Any]] = []   # [{episode_number, scene_number, shot_number, description, image_url}]
+    
     # Structured Data Storage (from JSON responses)
     structured_data: Dict[str, Any] = {}  # Stores complete JSON data from responses

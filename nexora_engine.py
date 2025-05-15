@@ -21,6 +21,7 @@ from agents.ad import ad_agent
 from agents.video_design import video_design_agent
 from agents.editor import editor_agent
 from agents.producer import producer_agent
+from agents.storyboard import storyboard_agent
 
 load_dotenv()
 
@@ -37,6 +38,7 @@ agent_map = {
     "AD": ad_agent,
     "VideoDesign": video_design_agent,
     "Editor": editor_agent,
+    "Storyboard": storyboard_agent,
 }
 
 # New function to handle detailed character generation
@@ -738,6 +740,9 @@ Format each as: "Character Name, brief description"
             # Call the agent function with appropriate arguments
             if agent_name == "Writer":
                 updated_state = agent_fn(state, user_message, profile_key)
+            elif agent_name == "Storyboard":
+                # Add special handling for Storyboard agent
+                updated_state = agent_fn(state, user_message)
             else:
                 updated_state = agent_fn(state)
             
@@ -820,6 +825,73 @@ Format each as: "Character Name, brief description"
                         response_text += updated_state.last_agent_output
                     else:
                         response_text += f"The {agent_name} agent has processed your request.\n\n"
+            
+            elif agent_name == "Storyboard":
+                # Handle Storyboard agent output
+                response_text = ""
+                
+                # If we have storyboard data, format it nicely
+                if hasattr(updated_state, "storyboard") and updated_state.storyboard:
+                    # Extract episode and scene numbers from the first item
+                    if updated_state.storyboard:
+                        first_item = updated_state.storyboard[0]
+                        ep_num = first_item.get("episode_number", 1)
+                        scene_num = first_item.get("scene_number", 1)
+                        
+                        # Add a title
+                        scene_title = f"Scene {scene_num} from Episode {ep_num}"
+                        response_text += f"# Storyboard: {scene_title}\n\n"
+                        
+                        # Add each shot with its image
+                        for item in updated_state.storyboard:
+                            shot_num = item.get("shot_number", 0)
+                            description = item.get("description", "")
+                            image_url = item.get("image_url", "")
+                            
+                            response_text += f"## Shot {shot_num}\n\n"
+                            response_text += f"{description}\n\n"
+                            
+                            if image_url:
+                                response_text += f"![Shot {shot_num}]({image_url})\n\n"
+                    
+                    # Special database update to preserve storyboard data
+                    print(f"Storyboard generated with {len(updated_state.storyboard)} shots, saving to database")
+                    
+                    try:
+                        # Get existing data first
+                        existing_project = projects.find_one({"session_id": session_id})
+                        existing_storyboard = []
+                        
+                        if existing_project and "story_data" in existing_project and "storyboard" in existing_project["story_data"]:
+                            existing_storyboard = existing_project["story_data"]["storyboard"]
+                            print(f"Found {len(existing_storyboard)} existing storyboard items in database")
+                        
+                        # Merge with new items
+                        merged_storyboard = existing_storyboard + updated_state.storyboard
+                        print(f"Merged storyboard now has {len(merged_storyboard)} items")
+                        
+                        # Update project with merged data
+                        state_dict = updated_state.model_dump()
+                        state_dict["storyboard"] = merged_storyboard
+                        
+                        projects.update_one(
+                            {"session_id": session_id},
+                            {"$set": {
+                                "story_data": state_dict,
+                                "updated_at": datetime.utcnow()
+                            }},
+                            upsert=True
+                        )
+                        print(f"✅ Saved merged storyboard data to database with {len(merged_storyboard)} total items")
+                    except Exception as storyboard_err:
+                        print(f"Error saving storyboard data: {storyboard_err}")
+                else:
+                    # No storyboard data available
+                    response_text = "# Storyboard\n\nNo storyboard data available for this scene."
+            
+            else:
+                # Default handling for other agents
+                response_text = f"The {agent_name} agent has processed your request.\n\n"
             
             # Save updated state to the database
             try:
@@ -949,6 +1021,10 @@ def ensure_state_attributes(state: StoryState) -> StoryState:
         state.video_clips = []
     if not hasattr(state, "session_id") or state.session_id is None:
         state.session_id = ""
+        
+    # Storyboard data
+    if not hasattr(state, "storyboard") or state.storyboard is None:
+        state.storyboard = []
 
     # Structured Data Storage
     if not hasattr(state, "structured_data") or state.structured_data is None:

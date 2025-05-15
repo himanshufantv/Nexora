@@ -22,6 +22,7 @@ from agents.ad import ad_agent
 from agents.director import director_agent
 from agents.video_design import video_design_agent
 from agents.editor import editor_agent
+from agents.storyboard import storyboard_agent
 
 load_dotenv()
 
@@ -41,6 +42,7 @@ agent_map = {
     "AD": ad_agent,
     "VideoDesign": video_design_agent,
     "Editor": editor_agent,
+    "Storyboard": storyboard_agent,
 }
 
 class StartChatRequest(BaseModel):
@@ -645,7 +647,7 @@ async def send_chat_message(req: SendChatRequest):
             "synopsis": stored_synopsis,  # Always use the stored synopsis instead of logline
             "script": "",
             "character": [],
-            "storyboard": None,
+            "storyboard": state.storyboard if hasattr(state, "storyboard") and state.storyboard else [],
             "episodes": []
         }
         
@@ -697,7 +699,7 @@ async def send_chat_message(req: SendChatRequest):
                     "synopsis": stored_synopsis,
                     "script": "",  # Empty script - no episode generation
                     "character": [],
-                    "storyboard": None,
+                    "storyboard": state.storyboard if hasattr(state, "storyboard") and state.storyboard else [],
                     "episodes": []  # Empty episodes array for first call
                 }
                 
@@ -1254,18 +1256,18 @@ async def send_chat_message(req: SendChatRequest):
             
             # Create final response format
             response = {
-                "prompt": prompt,
-                "left_section": streamed_left_section,
+                "prompt": req.prompt,
+                "left_section": chat_history,
                 "tabs": suggestions,
-                "synopsis": stored_synopsis,
+                "synopsis": project.get("synopsis", "") if project else "",
                 "script": response_text,
-                "character": [],  # Default to empty character array
-                "storyboard": None,
+                "character": character_data,
+                "storyboard": refreshed_project.get("story_data", {}).get("storyboard", []) if refreshed_project else [],
                 "episodes": episodes_data
             }
             
             # Only include character data in the response if it has proper image URLs or is explicitly a character request
-            is_character_request = any(term in prompt.lower() for term in ["create characters", "finalize characters", "finalise characters"])
+            is_character_request = any(term in req.prompt.lower() for term in ["create characters", "finalize characters", "finalise characters"])
             has_proper_characters = False
             
             if character_data and isinstance(character_data, list):
@@ -1478,12 +1480,13 @@ async def refresh_session(req: SendChatRequest):
         
         # Create a UI-ready response with refreshed data
         response = {
-            "prompt": "",
+            "prompt": req.prompt,
             "left_section": chat_history,
-            "tabs": [],
-            "synopsis": stored_synopsis,
+            "tabs": await generate_chat_suggestions(req.session_id),
+            "synopsis": project.get("synopsis", "") if project else "",
             "script": script_content,  # Include latest script content
-            "character": [],  # Default to empty array
+            "character": refreshed_characters if refreshed_characters else [],
+            "storyboard": refreshed_project.get("story_data", {}).get("storyboard", []) if refreshed_project else [],
             "episodes": refreshed_episodes if refreshed_episodes else []
         }
         
@@ -1513,10 +1516,6 @@ async def refresh_session(req: SendChatRequest):
                 response["character"] = filtered_characters
             else:
                 print("Characters have no image URLs - returning empty character array")
-        
-        # Get suggestions
-        suggestions = await generate_chat_suggestions(req.session_id)
-        response["tabs"] = suggestions
         
         return response
     except Exception as e:
@@ -1557,3 +1556,48 @@ def _ensure_character_profile_fields(profile):
         profile.pop("image_url")
     
     return profile
+
+# Add this new function after other formatting functions (around line 250)
+def format_storyboard_as_markdown(storyboard):
+    try:
+        if not storyboard:
+            return "No storyboard available."
+            
+        # Organize storyboard items by episode and scene
+        organized_items = {}
+        for item in storyboard:
+            ep_num = item.get("episode_number", 0)
+            scene_num = item.get("scene_number", 0)
+            
+            if ep_num not in organized_items:
+                organized_items[ep_num] = {}
+                
+            if scene_num not in organized_items[ep_num]:
+                organized_items[ep_num][scene_num] = []
+                
+            organized_items[ep_num][scene_num].append(item)
+            
+        # Build markdown
+        markdown = "# Scene Storyboard\n\n"
+        
+        for ep_num in sorted(organized_items.keys()):
+            for scene_num in sorted(organized_items[ep_num].keys()):
+                shots = organized_items[ep_num][scene_num]
+                
+                markdown += f"## Episode {ep_num}, Scene {scene_num}\n\n"
+                
+                for shot in shots:
+                    shot_num = shot.get("shot_number", 0)
+                    description = shot.get("description", "")
+                    image_url = shot.get("image_url", "")
+                    
+                    markdown += f"### Shot {shot_num}\n\n"
+                    markdown += f"{description}\n\n"
+                    
+                    if image_url:
+                        markdown += f"![Shot {shot_num}]({image_url})\n\n"
+                    
+        return markdown
+    except Exception as e:
+        print(f"Error formatting storyboard: {e}")
+        return "Error formatting storyboard."
