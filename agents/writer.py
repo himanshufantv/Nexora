@@ -79,6 +79,7 @@ Respond in this format:
         "characters": parsed.get("characters", []),
         "episodes": parsed.get("episodes", [])
     })
+    
     new_state.last_agent_output = parsed
     log_agent_output("Writer", new_state)
     return new_state

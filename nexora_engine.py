@@ -165,6 +165,7 @@ For each character, describe their physical appearance, age, clothing style, and
                 for chunk in response:
                     if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
+                        print("content is ......",content)
                         buffer += content
                         
                         # If we already hit the JSON section, don't stream
@@ -469,7 +470,8 @@ Keep your description under 100 words and make it visually rich.
                     temperature=0.8,
                     stream=True,
                 )
-                
+
+                print("respomse is....")
                 # Buffer to accumulate chunks for more natural word grouping
                 buffer = ""
                 full_response = ""
@@ -478,10 +480,14 @@ Keep your description under 100 words and make it visually rich.
                 # Stream the response chunks
                 for chunk in response:
                     # Extract the content from the chunk
+                
                     if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
                         buffer += content
                         full_response += content
+                        print("content is ......",content)
+                        print("full_response is ......",full_response)
+                        print("buffer is ......",buffer)
                         
                         # If we already hit the JSON section, just accumulate for DB but don't stream
                         if stop_streaming:
@@ -519,7 +525,7 @@ Keep your description under 100 words and make it visually rich.
                 
                 # Send any remaining content in buffer (but not if we're in JSON section)
                 if buffer.strip() and not stop_streaming:
-                    yield f"data: {buffer}\n\n"
+                    yield f"data: {buffer}\n\n "
                 
                 # Update the state with the generated content (simplified for now)
                 if full_response:
@@ -596,7 +602,7 @@ Keep your description under 100 words and make it visually rich.
                                         state.logline = logline
                             
                             # Try to extract characters
-                            characters_section = re.search(r'## Characters(.*?)(?=^##|\Z)', full_response, re.MULTILINE | re.DOTALL)
+                            characters_section = re.search(r'## Characters(.*?)(?=^## |\Z)', full_response, re.MULTILINE | re.DOTALL)
                             if characters_section:
                                 character_lines = re.findall(r'- (.*)', characters_section.group(1))
                                 if character_lines:
@@ -604,7 +610,7 @@ Keep your description under 100 words and make it visually rich.
                             
                             # Try to extract episodes
                             episodes = []
-                            episode_sections = re.finditer(r'### Episode \d+: (.*?)\n(.*?)(?=^###|\Z)', full_response, re.MULTILINE | re.DOTALL)
+                            episode_sections = re.finditer(r'### Episode \d+: (.*?)\n(.*?)(?=^### |\Z)', full_response, re.MULTILINE | re.DOTALL)
                             for match in episode_sections:
                                 episode_title = match.group(1).strip()
                                 episode_summary = match.group(2).strip()
