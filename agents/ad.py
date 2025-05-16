@@ -294,12 +294,27 @@ def ad_agent(state: StoryState, episode_number=None, scene_number=None, seed=Non
     # Track the last seed used for returning to caller
     last_generated_seed = None
     
+    # Initialize scene_seeds if it doesn't exist
+    if not hasattr(state, "scene_seeds") or state.scene_seeds is None:
+        state.scene_seeds = {}
+    
     # Check if we're targeting a specific episode/scene
     is_specific_request = episode_number is not None and scene_number is not None
     if is_specific_request:
+        # Create standardized scene key
+        scene_key = f"episode_{episode_number}_scene_{scene_number}"
+        
         print(f"🎯 Targeting specific episode {episode_number}, scene {scene_number}" + 
               (f" with seed {seed}" if seed else ""))
-    
+        
+        # If a seed was provided, always use it for consistency
+        if seed:
+            last_generated_seed = seed
+            print(f"✓ Using provided seed {seed} for consistent visuals")
+            # Store the seed in state.scene_seeds for future reference
+            state.scene_seeds[scene_key] = seed
+            print(f"✓ Stored seed {seed} in state.scene_seeds for {scene_key}")
+
     # Ensure character profiles exist before proceeding
     state, characters_updated = ensure_character_profiles(state)
     
@@ -432,12 +447,48 @@ Respond ONLY with the image prompt.
                     print(f"LoRA type: {lora_type}")
                     print(f"LoRA value: {lora_to_use}")
                     print(f"Character pair: {char_pair}")
-                    print(f"Generating first image in scene (seed will be auto-generated)")
-                    image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
-                    if used_seed is not None:
-                        scene_seed = used_seed
-                        last_generated_seed = used_seed  # Store for returning to caller
-                        print(f"Generated seed {scene_seed} will be used for subsequent shots in this scene")
+                    
+                    # Check if we already have a seed for this scene in state.scene_seeds
+                    # Extract episode and scene numbers from scene_key
+                    scene_key_parts = scene_key.split('_')
+                    if len(scene_key_parts) >= 2:
+                        try:
+                            ep_num = int(scene_key_parts[0][2:])  # Extract number from "ep1"
+                            scene_num = int(scene_key_parts[1][5:])  # Extract number from "scene1"
+                            state_scene_key = f"episode_{ep_num}_scene_{scene_num}"
+                            
+                            if state_scene_key in state.scene_seeds:
+                                # Use the seed from state
+                                stored_seed = state.scene_seeds[state_scene_key]
+                                print(f"Found stored seed {stored_seed} for {state_scene_key}")
+                                scene_seed = stored_seed
+                                image_url, _ = generate_flux_image(image_prompt, hf_lora=lora_to_use, seed=scene_seed)
+                                last_generated_seed = scene_seed
+                            else:
+                                # Generate a new seed
+                                print(f"Generating first image in scene (seed will be auto-generated)")
+                                image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
+                                if used_seed is not None:
+                                    scene_seed = used_seed
+                                    last_generated_seed = used_seed
+                                    # Save the seed in state.scene_seeds
+                                    state.scene_seeds[state_scene_key] = scene_seed
+                                    print(f"Generated and stored seed {scene_seed} for {state_scene_key}")
+                                    print(f"Generated seed {scene_seed} will be used for subsequent shots in this scene")
+                        except (ValueError, IndexError):
+                            # If parsing fails, just generate a new image
+                            print(f"Failed to parse scene key '{scene_key}', generating image with new seed")
+                            image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
+                            if used_seed is not None:
+                                scene_seed = used_seed
+                                last_generated_seed = used_seed
+                    else:
+                        # Invalid scene key format, just generate a new image
+                        print(f"Invalid scene key format '{scene_key}', generating image with new seed")
+                        image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
+                        if used_seed is not None:
+                            scene_seed = used_seed
+                            last_generated_seed = used_seed
                 else:
                     print(f"========== CHARACTER SCENE IMAGE GENERATION ==========")
                     print(f"Shot key: {unique_key}")
@@ -650,12 +701,51 @@ Keep your description under 100 words and make it visually rich.
                 print(f"✅ {scene_key} → {image_url[:50]}...")
                 ad_images[scene_key] = image_url
 
-    new_state = state.copy(update={
-        "ad_prompts": ad_prompts,
-        "ad_images": ad_images,
-        "ad_character_info": ad_character_info,
-        "last_generated_seed": last_generated_seed  # Add the last used seed to state
-    })
-
-    log_agent_output("AD", new_state)
-    return new_state
+    # Save state updates
+    state.ad_prompts = ad_prompts
+    state.ad_images = ad_images
+    state.ad_character_info = ad_character_info
+    
+    # Store the last generated seed in the state for the caller to access
+    state.last_generated_seed = last_generated_seed
+    
+    # Update scene_seeds if we generated any new ones
+    if scene_background_seeds:
+        print(f"📝 Updating state.scene_seeds with {len(scene_background_seeds)} new seeds")
+        for k, v in scene_background_seeds.items():
+            # Convert from ep1_scene1 format to episode_1_scene_1 format
+            parts = k.split('_')
+            if len(parts) >= 2:
+                try:
+                    ep_num = int(parts[0][2:])  # Extract number from "ep1"
+                    scene_num = int(parts[1][5:])  # Extract number from "scene1"
+                    standardized_key = f"episode_{ep_num}_scene_{scene_num}"
+                    state.scene_seeds[standardized_key] = v
+                    print(f"✓ Converted {k} to {standardized_key} with seed {v}")
+                except (ValueError, IndexError):
+                    # Just use the original key if parsing fails
+                    state.scene_seeds[k] = v
+            else:
+                # Just use the original key
+                state.scene_seeds[k] = v
+    
+    # Process the episodic images (e.g. scene_key = episode_1)
+    for scene_key, image_url in ad_images.items():
+        if scene_key.startswith('episode_') and '_scene_' not in scene_key:
+            # Convert from episode_1 format to standardized key format
+            try:
+                ep_num = scene_key.split('_')[1]
+                if ep_num.isdigit():
+                    if last_generated_seed and is_specific_request and int(ep_num) == episode_number:
+                        # Store the seed for this episode
+                        state.scene_seeds[scene_key] = last_generated_seed
+                        print(f"✓ Stored seed {last_generated_seed} for {scene_key}")
+            except (IndexError, ValueError):
+                pass
+        
+    print(f"🏁 AD Agent complete. Processed {len(ad_images)} images with {len(state.scene_seeds)} seeds stored.")
+    
+    log_agent_output("AD", state)
+    print("✅ AD Agent completed image generation")
+    
+    return state

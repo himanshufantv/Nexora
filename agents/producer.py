@@ -158,7 +158,13 @@ def producer_agent(state: StoryState, user_input: str) -> str:
         "visualize scene", "create shots for scene"
     ]
     
-    # Check for specific scene creation requests (which should go to Storyboard)
+    # ✅ NEW: Detect explicit "generate storyboard" requests
+    generate_storyboard_request = "generate storyboard" in user_input.lower() or "create storyboard" in user_input.lower()
+    if generate_storyboard_request:
+        print("✅ Explicit storyboard generation request detected, routing to Storyboard agent")
+        return "Storyboard"
+    
+    # Check for specific scene creation requests (which should go to Storyboard for description only)
     scene_match = re.search(r'(create|make|generate)\s+scene\s+(\d+)', user_input.lower())
     scene_request = bool(scene_match) or any(keyword in user_input.lower() for keyword in storyboard_keywords)
     
