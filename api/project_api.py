@@ -782,7 +782,7 @@ async def send_chat_message(req: SendChatRequest):
                 print(f"Generated thinking process: {len(thinking_process)} chars")
                 
                 # Create a better initial message instead of showing thinking process
-                initial_message = f"## {stored_synopsis.split('\"')[1] if '\"' in stored_synopsis else 'New Story'}\n\n"
+                initial_message = f"## {stored_synopsis.split(chr(34))[1] if chr(34) in stored_synopsis else 'New Story'}\n\n"
                 initial_message += "I'll help you create this romantic drama series. You can start by:\n\n"
                 initial_message += "- Creating episodes for the series\n"
                 initial_message += "- Developing the main characters\n"
