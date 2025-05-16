@@ -598,22 +598,25 @@ Format your response in markdown with appropriate headers.
                 # Use existing scenes to generate images
                 if is_specific_scene:
                     print(f"Calling AD agent with specific scene request: episode {episode_number}, scene {scene_number}")
-                    # Check if we have a seed to pass
+                    # Standardize the scene key format to ensure consistency
                     scene_key = f"episode_{episode_number}_scene_{scene_number}"
+                    
+                    # Check if we have a seed to pass
                     if hasattr(state, "scene_seeds") and scene_key in state.scene_seeds:
                         seed_value = state.scene_seeds[scene_key]
                         print(f"Passing existing seed {seed_value} for consistent imagery")
                         updated_state = ad_agent(state, episode_number=episode_number, scene_number=scene_number, seed=seed_value)
                     else:
-                        updated_state = ad_agent(state, episode_number=episode_number, scene_number=scene_number)
-                        # Check if a seed was generated and save it
-                        if hasattr(updated_state, "ad_images") and scene_key in updated_state.ad_images:
-                            # Save the seed if it was returned
-                            if not hasattr(updated_state, "scene_seeds"):
-                                updated_state.scene_seeds = {}
-                            if hasattr(updated_state, "last_generated_seed") and updated_state.last_generated_seed:
-                                updated_state.scene_seeds[scene_key] = updated_state.last_generated_seed
-                                print(f"Saved new seed {updated_state.last_generated_seed} for {scene_key}")
+                        # Generate a random seed if none exists
+                        seed_value = random.randint(1, 2147483647)
+                        print(f"Generated new seed {seed_value} for scene")
+                        updated_state = ad_agent(state, episode_number=episode_number, scene_number=scene_number, seed=seed_value)
+                        
+                        # Save the generated seed
+                        if not hasattr(updated_state, "scene_seeds"):
+                            updated_state.scene_seeds = {}
+                        updated_state.scene_seeds[scene_key] = seed_value
+                        print(f"Saved new seed {seed_value} for {scene_key}")
                 else:
                     updated_state = ad_agent(state)
                 
@@ -631,6 +634,12 @@ Format your response in markdown with appropriate headers.
                         print(f"✅ Found image URL for {scene_key}: {image_url[:50]}...")
                         response_text += f"## {scene_title}\n\n"
                         response_text += f"![{scene_title}]({image_url})\n\n"
+                        
+                        # Include seed information in the response for debugging
+                        if hasattr(updated_state, "scene_seeds") and scene_key in updated_state.scene_seeds:
+                            seed_value = updated_state.scene_seeds[scene_key]
+                            print(f"ℹ️ Including seed {seed_value} information in response")
+                            response_text += f"*Seed: {seed_value}*\n\n"
                         
                         if scene_key in updated_state.ad_prompts:
                             response_text += updated_state.ad_prompts[scene_key] + "\n\n"
@@ -739,99 +748,123 @@ Format each as: "Character Name, brief description"
             
             # Call the agent function with appropriate arguments
             if agent_name == "Writer":
+                # Special handling for "create episodes" command which is failing
+                # Initialize response_text for ALL writer agent calls to prevent the error
+                response_text = ""
+                
+                # Special handling for episode creation commands (both singular and plural)
+                if "create episode" in user_message.lower() or "create episodes" in user_message.lower():
+                    # Ensure response_text is initialized (redundant but explicit)
+                    response_text = ""
+                
+                # Call the Writer agent with profile
                 updated_state = agent_fn(state, user_message, profile_key)
+                
+                # Add code to properly format writer agent responses for episodes
+                if "create episodes" in user_message.lower():
+                    print("Formatting episodes response")
+                    response_text = "# Episodes Created\n\n"
+                    if hasattr(updated_state, "episodes") and updated_state.episodes:
+                        for ep in updated_state.episodes:
+                            ep_num = ep.get("episode_number", "")
+                            ep_title = ep.get("episode_title", "")
+                            ep_summary = ep.get("summary", "")
+                            response_text += f"## Episode {ep_num}: {ep_title}\n\n{ep_summary}\n\n"
+                    else:
+                        response_text = "Failed to create episodes. Please try again."
+                
+                # Handle response for single episode creation
+                elif "create episode" in user_message.lower() and "scene" not in user_message.lower():
+                    print("Formatting single episode response")
+                    
+                    # Extract episode number from user message
+                    episode_match = re.search(r'episode\s+(\d+)', user_message.lower())
+                    episode_number = episode_match.group(1) if episode_match else "1"
+                    
+                    response_text = f"# Episode {episode_number} Created\n\n"
+                    
+                    # Get episode details
+                    if hasattr(updated_state, "episodes") and updated_state.episodes:
+                        # Find matching episode
+                        matching_episode = None
+                        for ep in updated_state.episodes:
+                            if str(ep.get("episode_number", "")) == episode_number:
+                                matching_episode = ep
+                                break
+                        
+                        if matching_episode:
+                            ep_title = matching_episode.get("episode_title", "")
+                            ep_summary = matching_episode.get("summary", "")
+                            response_text += f"## {ep_title}\n\n{ep_summary}\n\n"
+                            
+                            # Add scene information if available
+                            if hasattr(updated_state, "structured_scenes") and episode_number in updated_state.structured_scenes:
+                                response_text += "### Scenes:\n\n"
+                                for scene in updated_state.structured_scenes[episode_number]:
+                                    scene_num = scene.get("scene_number", "")
+                                    scene_title = scene.get("title", "")
+                                    response_text += f"- Scene {scene_num}: {scene_title}\n"
+                        else:
+                            response_text += "Episode details not found."
+                    else:
+                        response_text += "Episode details not available."
+                
+                # Handle scene creation with no response text
+                elif "create" in user_message.lower() and "scene" in user_message.lower():
+                    print("Formatting scene response")
+                    
+                    # Extract episode and scene numbers
+                    episode_match = re.search(r'episode\s+(\d+)', user_message.lower())
+                    scene_match = re.search(r'scene\s+(\d+)', user_message.lower())
+                    
+                    episode_number = episode_match.group(1) if episode_match else "1"
+                    scene_number = scene_match.group(1) if scene_match else "1"
+                    
+                    response_text = f"# Scene {scene_number} from Episode {episode_number}\n\n"
+                    
+                    # Get scene information
+                    if (hasattr(updated_state, "structured_scenes") and 
+                        episode_number in updated_state.structured_scenes):
+                        
+                        matching_scene = None
+                        for scene in updated_state.structured_scenes[episode_number]:
+                            if str(scene.get("scene_number", "")) == scene_number:
+                                matching_scene = scene
+                                break
+                        
+                        if matching_scene:
+                            scene_title = matching_scene.get("title", "")
+                            scene_desc = matching_scene.get("description", "")
+                            response_text += f"## {scene_title}\n\n{scene_desc}\n\n"
+                        else:
+                            response_text += "Scene details not found."
+                    
+                    # Try to get from episode_scripts as fallback
+                    elif (hasattr(updated_state, "episode_scripts") and 
+                          episode_number in updated_state.episode_scripts and
+                          len(updated_state.episode_scripts[episode_number]) >= int(scene_number)):
+                        
+                        scene_text = updated_state.episode_scripts[episode_number][int(scene_number)-1]
+                        response_text += f"{scene_text}\n\n"
+                    else:
+                        response_text += "Scene details not available."
+                
+                # Ensure there's always a response
+                if not response_text:
+                    print("No specific response text generated, using generic response")
+                    response_text = "Content has been processed successfully."
             elif agent_name == "Storyboard":
                 # Add special handling for Storyboard agent
                 updated_state = agent_fn(state, user_message)
-            else:
-                updated_state = agent_fn(state)
-            
-            # Process agent response based on agent type
-            if agent_name == "Writer":
-                # Format Writer agent response as markdown
-                # Only display the title without extra headers
-                response_text = f"# {updated_state.title}\n\n"
                 
-                if updated_state.episodes and not updated_state.episode_scripts and not updated_state.scene_scripts:
-                    # Series overview - but skip the title and logline headers since we already included the title
-                    if updated_state.characters:
-                        response_text += "## Characters\n\n"
-                        for char in updated_state.characters:
-                            response_text += f"- {char}\n"
-                        response_text += "\n"
-                    
-                    response_text += "## Episodes\n\n"
-                    for ep in updated_state.episodes:
-                        ep_num = ep.get("episode_number", 0)
-                        ep_title = ep.get("episode_title", f"Episode {ep_num}")
-                        ep_summary = ep.get("summary", "No summary available")
-                        
-                        response_text += f"### Episode {ep_num}: {ep_title}\n\n"
-                        response_text += f"{ep_summary}\n\n"
-                
-                elif updated_state.episode_scripts:
-                    # Episode scenes
-                    response_text += "## Episode Scenes\n\n"
-                    
-                    # Check if we have the new structured format
-                    if hasattr(updated_state, "structured_scenes") and updated_state.structured_scenes:
-                        for ep_num, scenes in updated_state.structured_scenes.items():
-                            response_text += f"### Episode {ep_num}\n\n"
-                            
-                            for scene in scenes:
-                                scene_num = scene.get("scene_number", 0)
-                                scene_title = scene.get("title", f"Scene {scene_num}")
-                                scene_description = scene.get("description", "")
-                                
-                                # Remove the redundant "Scene X:" prefix if it exists
-                                scene_prefix_pattern = re.match(r'^Scene\s*\d+\s*:\s*(.*)', scene_description, re.IGNORECASE)
-                                if scene_prefix_pattern:
-                                    scene_description = scene_prefix_pattern.group(1).strip()
-                                
-                                response_text += f"#### Scene {scene_num}: {scene_title}\n\n"
-                                response_text += f"{scene_description}\n\n"
-                    # Fall back to old format if structured scenes not available
-                    else:
-                        for ep_num, scenes in updated_state.episode_scripts.items():
-                            response_text += f"### Episode {ep_num}\n\n"
-                            
-                            for i, scene in enumerate(scenes):
-                                response_text += f"#### Scene {i+1}\n\n"
-                                response_text += f"{scene}\n\n"
-                
-                elif updated_state.scene_scripts:
-                    # Scene details
-                    response_text += "## Scene Breakdown\n\n"
-                    
-                    for scene_key, shots in updated_state.scene_scripts.items():
-                        match = re.match(r'ep(\d+)_scene(\d+)', scene_key)
-                        if match:
-                            ep_num, scene_num = match.groups()
-                            response_text += f"### Episode {ep_num}, Scene {scene_num}\n\n"
-                        else:
-                            response_text += f"### {scene_key}\n\n"
-                        
-                        for i, shot in enumerate(shots):
-                            response_text += f"#### Shot {i+1}\n\n"
-                            
-                            if "shot" in shot:
-                                response_text += f"**Visual:** {shot['shot']}\n\n"
-                            
-                            if "dialogue" in shot:
-                                response_text += f"**Dialogue:** {shot['dialogue']}\n\n"
-                else:
-                    # Default response for other cases
-                    if hasattr(updated_state, 'last_agent_output') and updated_state.last_agent_output:
-                        response_text += updated_state.last_agent_output
-                    else:
-                        response_text += f"The {agent_name} agent has processed your request.\n\n"
-            
-            elif agent_name == "Storyboard":
                 # Handle Storyboard agent output
                 response_text = ""
                 
+                # Check if this is an explicit storyboard generation request
+                is_explicit_storyboard_request = "generate storyboard" in user_message.lower() or "create storyboard" in user_message.lower()
+                
                 # If we have storyboard data, format it nicely
-                if hasattr(updated_state, "storyboard") and updated_state.storyboard:
+                if is_explicit_storyboard_request and hasattr(updated_state, "storyboard") and updated_state.storyboard:
                     # Extract episode and scene numbers from the first item
                     if updated_state.storyboard:
                         first_item = updated_state.storyboard[0]
@@ -858,7 +891,6 @@ Format each as: "Character Name, brief description"
                     print(f"Storyboard generated with {len(updated_state.storyboard)} shots, saving to database")
                     
                     try:
-                        # Get existing data first
                         existing_project = projects.find_one({"session_id": session_id})
                         existing_storyboard = []
                         
@@ -886,20 +918,46 @@ Format each as: "Character Name, brief description"
                     except Exception as storyboard_err:
                         print(f"Error saving storyboard data: {storyboard_err}")
                 else:
-                    # No storyboard data available
-                    response_text = "# Storyboard\n\nNo storyboard data available for this scene."
-            
+                    # Scene creation request (not storyboard generation)
+                    # Extract episode and scene numbers from the message
+                    episode_match = re.search(r'episode\s+(\d+)', user_message.lower())
+                    scene_match = re.search(r'scene\s+(\d+)', user_message.lower())
+                    
+                    ep_num = int(episode_match.group(1)) if episode_match else 1
+                    scene_num = int(scene_match.group(1)) if scene_match else 1
+                    
+                    # Get scene description from scene_scripts
+                    scene_key = f"ep{ep_num}_scene{scene_num}"
+                    scene_script = []
+                    
+                    if hasattr(updated_state, "scene_scripts") and scene_key in updated_state.scene_scripts:
+                        scene_script = updated_state.scene_scripts[scene_key]
+                    
+                    # Format script response
+                    response_text = f"# Scene {scene_num} from Episode {ep_num}\n\n"
+                    
+                    for i, shot in enumerate(scene_script):
+                        shot_desc = shot.get("shot", "")
+                        shot_dialogue = shot.get("dialogue", "")
+                        
+                        response_text += f"## Shot {i+1}\n\n"
+                        response_text += f"{shot_desc}\n\n"
+                        
+                        if shot_dialogue:
+                            response_text += f"**Dialogue:** {shot_dialogue}\n\n"
             else:
+                updated_state = agent_fn(state)
                 # Default handling for other agents
                 response_text = f"The {agent_name} agent has processed your request.\n\n"
             
             # Save updated state to the database
             try:
-                # Check if we have scene images before saving
-                if hasattr(updated_state, "ad_images") and updated_state.ad_images:
-                    print(f"💾 Saving state with {len(updated_state.ad_images)} ad_images")
-                    for key, url in updated_state.ad_images.items():
-                        print(f"  - {key}: {url[:50]}...")
+                # Check if we have scene images and seeds before saving
+                has_seeds = hasattr(updated_state, "scene_seeds") and updated_state.scene_seeds
+                if has_seeds:
+                    print(f"💾 Saving state with {len(updated_state.scene_seeds)} scene seeds")
+                    for key, seed in updated_state.scene_seeds.items():
+                        print(f"  - {key}: seed {seed}")
                 
                 projects.update_one(
                     {"session_id": session_id},
@@ -913,15 +971,15 @@ Format each as: "Character Name, brief description"
                 
                 # Verify the update by reading it back
                 updated_doc = projects.find_one({"session_id": session_id})
-                if updated_doc and "story_data" in updated_doc and "ad_images" in updated_doc["story_data"]:
-                    print(f"✅ Verified update: Found {len(updated_doc['story_data']['ad_images'])} ad_images in DB")
-                    if hasattr(updated_state, "ad_images"):
-                        for key in updated_state.ad_images.keys():
-                            if key in updated_doc["story_data"]["ad_images"]:
-                                print(f"  - Verified {key} is in DB")
+                if updated_doc and "story_data" in updated_doc:
+                    # Verify scene_seeds were saved
+                    if has_seeds and "scene_seeds" in updated_doc["story_data"]:
+                        print(f"✅ Verified update: Found {len(updated_doc['story_data']['scene_seeds'])} scene seeds in DB")
+                        for key in updated_state.scene_seeds.keys():
+                            if key in updated_doc["story_data"]["scene_seeds"]:
+                                print(f"  - Verified seed for {key} is in DB")
                             else:
-                                print(f"  ⚠️ WARNING: {key} not found in DB after update!")
-                
+                                print(f"  ⚠️ WARNING: Seed for {key} not found in DB after update!")
             except Exception as db_err:
                 print(f"❌ Database update error: {db_err}")
                 import traceback

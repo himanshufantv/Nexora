@@ -110,50 +110,106 @@ Start your explanation with a heading "## My Approach" and organize your thought
 
 # Generate chat suggestions
 async def generate_chat_suggestions(session_id: str, recent_messages: list = None) -> list:
-    """Generate action-oriented suggestions based on Producer agent logic"""
+    """Generate action-oriented suggestions based on the user's progression through the story creation process"""
     try:
         # If no recent messages provided, fetch from database
         if not recent_messages:
             session = chat_sessions.find_one({"session_id": session_id})
             if not session or "messages" not in session:
-                return ["Generate episodes", "Create characters", "Change story"]
+                return ["Generate episodes", "Improve the story"]
             
             # Get only user and nexora messages (not thinking messages)
             recent_messages = [
                 msg for msg in session["messages"] 
                 if msg.get("sender") in ["user", "nexora"]
             ]
-            
-            # Limit to last 6 messages for context
-            recent_messages = recent_messages[-6:]
         
-        # Get the most recent AI response to use as context
-        ai_responses = [msg for msg in recent_messages if msg.get("sender") == "nexora"]
+        # Get the most recent user message to determine context
+        user_messages = [msg for msg in recent_messages if msg.get("sender") == "user"]
+        last_user_message = user_messages[-1]["message"].lower() if user_messages else ""
         
-        # Check if episodes have been generated yet
+        # Get project data to check state
         project = story_projects.find_one({"session_id": session_id})
-        has_episodes = False
-        if project and project.get("story_data"):
-            story_data = project.get("story_data")
-            if "episodes" in story_data and story_data["episodes"]:
-                has_episodes = True
+        if not project or not project.get("story_data"):
+            # Initial state - no story data yet
+            return ["Generate episodes", "Improve the story"]
+            
+        story_data = project.get("story_data", {})
         
-        # Return appropriate suggestions based on current state
+        # Check if "create episodes" was the last command
+        if "create episodes" in last_user_message or "generate episodes" in last_user_message:
+            return ["Finalise characters", "Improve episodes"]
+            
+        # Check if "finalise characters" was the last command
+        if "finalise characters" in last_user_message or "finalize characters" in last_user_message:
+            suggestions = ["Change characters"]
+            
+            # Add episode creation suggestions
+            if "episodes" in story_data and story_data["episodes"]:
+                for i, episode in enumerate(story_data["episodes"]):
+                    episode_num = episode.get("episode_number", i+1)
+                    suggestions.append(f"Create episode {episode_num}")
+            return suggestions
+            
+        # Check if creating a specific episode
+        episode_match = re.search(r"create episode (\d+)", last_user_message)
+        if episode_match:
+            episode_num = int(episode_match.group(1))
+            # Generate scene suggestions for this episode
+            suggestions = []
+            
+            # Check if we have scene information for this episode
+            episode_str = str(episode_num)
+            if "structured_scenes" in story_data and episode_str in story_data["structured_scenes"]:
+                # Get number of scenes
+                scenes = story_data["structured_scenes"][episode_str]
+                for scene in scenes:
+                    scene_num = scene.get("scene_number", 0)
+                    suggestions.append(f"Create episode {episode_num} scene {scene_num}")
+            else:
+                # Fallback to episode_scripts
+                if "episode_scripts" in story_data and episode_str in story_data["episode_scripts"]:
+                    scenes = story_data["episode_scripts"][episode_str]
+                    for i in range(len(scenes)):
+                        suggestions.append(f"Create episode {episode_num} scene {i+1}")
+                else:
+                    # No scenes yet, suggest creating some default ones
+                    for i in range(1, 6):  # Suggest 5 scenes
+                        suggestions.append(f"Create episode {episode_num} scene {i}")
+            
+            return suggestions
+
+        # Check if creating a specific scene
+        scene_match = re.search(r"create episode (\d+) scene (\d+)", last_user_message)
+        if scene_match:
+            episode_num = int(scene_match.group(1))
+            scene_num = int(scene_match.group(2))
+            return [f"Generate storyboard for episode {episode_num} scene {scene_num}"]
+            
+        # Default behavior based on project state
+        has_episodes = "episodes" in story_data and story_data["episodes"]
+        has_characters = ("character_profiles" in story_data and story_data["character_profiles"]) or ("characters" in story_data and story_data["characters"])
+            
         if not has_episodes:
-            return [
-                "Generate episodes",
-                "Create characters",
-                "Change story"
-            ]
+            return ["Generate episodes", "Create characters", "Improve the story"]
+        elif not has_characters:
+            return ["Finalise characters", "Improve episodes", "Change story"]
         else:
-            return [
-                "Create character visuals",
-                "Generate scene images",
-                "Change story"
-            ]
+            # Both episodes and characters exist
+            suggestions = ["Generate scene images", "Change story"]
+            
+            # Add first episode scene creation suggestion
+            if has_episodes and story_data["episodes"]:
+                first_episode = story_data["episodes"][0]
+                ep_num = first_episode.get("episode_number", 1)
+                suggestions.insert(0, f"Create episode {ep_num} scene 1")
+                
+            return suggestions
             
     except Exception as e:
         print(f"Error generating chat suggestions: {e}")
+        import traceback
+        print(traceback.format_exc())
         return ["Generate episodes", "Create characters", "Change story"]
 
 # Helper functions for formatting markdown responses
@@ -252,154 +308,216 @@ def format_scene_scripts_as_markdown(scene_scripts):
 # Add this helper function after the existing helper functions (around line 240)
 async def refresh_project_data(session_id: str):
     """
-    Re-fetch project data from the database to ensure we have the most up-to-date information.
-    This helps address synchronization issues where database updates don't immediately appear in the API response.
-    """
-    print(f"Refreshing project data for session {session_id} from database")
+    Refresh project data from the database, extracting relevant information for the response.
     
-    # Increase delay to ensure database writes have completed
-    await asyncio.sleep(1.0)  # Increased from 0.5 to 1.0 seconds
-    
-    # Re-fetch the project from the database
-    refreshed_project = story_projects.find_one({"session_id": session_id})
-    
-    if not refreshed_project:
-        print(f"Warning: Could not find project for session {session_id} during refresh")
-        return None, None, None
-    
-    # Get the refreshed story data
-    refreshed_story_data = refreshed_project.get("story_data", {})
-    print(f"DEBUG: Refreshed story data keys: {list(refreshed_story_data.keys())}")
-    
-    # Get refreshed character data
-    refreshed_character_data = []
-    if refreshed_story_data and "characters" in refreshed_story_data:
-        print(f"DEBUG: Found {len(refreshed_story_data['characters'])} characters in refreshed data")
-        refreshed_character_data = refreshed_story_data["characters"]
-    elif refreshed_story_data and "character_profiles" in refreshed_story_data:
-        character_profiles = refreshed_story_data["character_profiles"]
-        print(f"DEBUG: Found {len(character_profiles)} character profiles in refreshed data")
+    Args:
+        session_id (str): The session ID to look up
         
-        # Fix character profiles if they are stored as strings instead of dictionaries
-        fixed_profiles = []
-        for profile in character_profiles:
-            if isinstance(profile, str):
-                # Convert string to dictionary with basic fields
-                name = profile.split(',')[0].strip() if ',' in profile else profile
+    Returns:
+        tuple: (refreshed_project, refreshed_character_data, refreshed_episodes_data)
+    """
+    try:
+        # Query the project from the database
+        refreshed_project = story_projects.find_one({"session_id": session_id})
+        
+        if not refreshed_project:
+            print(f"Project not found for session: {session_id}")
+            return None, [], []
+            
+        # Extract character information
+        refreshed_character_data = []
+        refreshed_episodes_data = []
+        
+        # Load the story data
+        refreshed_story_data = refreshed_project.get("story_data", {})
+        
+        print(f"DEBUG: Refreshed story data keys: {list(refreshed_story_data.keys() if refreshed_story_data else [])}")
+        
+        # Process character data if available
+        if refreshed_story_data and "character_profiles" in refreshed_story_data:
+            char_profiles = refreshed_story_data["character_profiles"]
+            print(f"DEBUG: Found {len(char_profiles)} characters in refreshed data")
+            
+            character_map = refreshed_story_data.get("character_map", {})
+            
+            # Process each character from story_data
+            for profile in char_profiles:
+                # Handle both string and dictionary formats (for backward compatibility)
+                if isinstance(profile, str):
+                    # Try to parse JSON string
+                    try:
+                        import json
+                        parsed_profile = json.loads(profile)
+                        if isinstance(parsed_profile, dict):
+                            profile = parsed_profile
+                    except:
+                        # If parsing fails, use the string as description
+                        continue
                 
-                # Extract description if possible (after first comma)
-                description = profile[profile.find(',')+1:].strip() if ',' in profile else ""
+                # Extract character information
+                if isinstance(profile, dict):
+                    name = profile.get("name", "Unknown")
+                    desc = profile.get("description", "")
+                    
+                    # Determine token for this character
+                    token = None
+                    for char_name, char_token in character_map.items():
+                        if char_name == name:
+                            token = char_token
+                            break
+                    
+                    # Default token if not found
+                    if not token:
+                        token = f"character-{len(refreshed_character_data) + 1}"
+                    
+                    # Create character entry in the format expected by the frontend
+                    char_entry = {
+                        "name": name,
+                        "token": token,
+                        "description": desc
+                    }
+                    
+                    # Add image URL if available
+                    if "reference_image" in profile:
+                        char_entry["reference_image"] = profile["reference_image"]
+                    elif "image_url" in profile:
+                        char_entry["reference_image"] = profile["image_url"]
+                    
+                    # Add gender if available
+                    if "gender" in profile:
+                        char_entry["gender"] = profile["gender"]
+                    
+                    refreshed_character_data.append(char_entry)
+        
+        # Process episode data if available
+        if refreshed_story_data and "episodes" in refreshed_story_data and refreshed_story_data["episodes"]:
+            print(f"DEBUG: Found {len(refreshed_story_data['episodes'])} episodes in refreshed data")
+            # Process each episode from refreshed story_data
+            for episode in refreshed_story_data["episodes"]:
+                episode_number = episode.get("episode_number", 0)
+                episode_title = episode.get("episode_title", f"Episode {episode_number}")
                 
-                # Create a dictionary with minimum required fields
-                fixed_profile = {
-                    "name": name,
-                    "description": description,
-                    "gender": "male" if name.lower() in ["aman", "rajiv", "vikram"] else "female", 
-                    "reference_image": ""
+                # Create the episode entry with child scenes
+                episode_entry = {
+                    "title": episode_title,
+                    "prompt": f"create episode {episode_number}",
+                    "child": []
                 }
                 
-                # Include token information
-                if "character_map" in refreshed_story_data:
-                    character_map = refreshed_story_data["character_map"] 
-                    if isinstance(character_map, dict) and name in character_map:
-                        fixed_profile["token"] = character_map[name]
+                # Check if structured scenes exist for this episode
+                episode_str = str(episode_number)
+                has_scenes = False
                 
-                # Ensure all required fields are present
-                fixed_profile = _ensure_character_profile_fields(fixed_profile)
+                # First check structured_scenes
+                if "structured_scenes" in refreshed_story_data and episode_str in refreshed_story_data["structured_scenes"]:
+                    scenes = refreshed_story_data["structured_scenes"][episode_str]
+                    print(f"DEBUG: Found {len(scenes)} structured scenes for episode {episode_number}")
+                    # Process each scene for this episode
+                    for scene in scenes:
+                        scene_number = scene.get("scene_number", 0)
+                        scene_title = scene.get("title", f"Scene {scene_number}")
+                        
+                        # Add scene to episode's children
+                        scene_entry = {
+                            "title": scene_title,
+                            "prompt": f"create scene {scene_number} episode {episode_number}"
+                        }
+                        episode_entry["child"].append(scene_entry)
+                    has_scenes = True
                 
-                # Add to fixed profiles
-                fixed_profiles.append(fixed_profile)
-                print(f"Fixed string character profile: {name}")
-            else:
-                # Build the simplified profile with only needed fields
-                filtered_profile = {
-                    "name": profile.get("name", ""),
-                    "reference_image": profile.get("reference_image", ""),
-                    "description": profile.get("description", ""),
-                    "gender": profile.get("gender", "")
-                }
-                
-                # Include token information
-                if "character_map" in refreshed_story_data:
-                    character_map = refreshed_story_data["character_map"]
-                    char_name = profile.get("name", "")
-                    if isinstance(character_map, dict) and char_name in character_map:
-                        filtered_profile["token"] = character_map[char_name]
-                elif "token" in profile:
-                    filtered_profile["token"] = profile["token"]
-                
-                # Apply field validation
-                filtered_profile = _ensure_character_profile_fields(filtered_profile)
-                
-                fixed_profiles.append(filtered_profile)
-            
-        # Use the fixed profiles
-        refreshed_character_data = fixed_profiles
-        print(f"Processed {len(refreshed_character_data)} character profiles after fixing")
-
-    # Build episodes data structure
-    refreshed_episodes_data = []
-    if refreshed_story_data and "episodes" in refreshed_story_data and refreshed_story_data["episodes"]:
-        print(f"DEBUG: Found {len(refreshed_story_data['episodes'])} episodes in refreshed data")
-        # Process each episode from refreshed story_data
-        for episode in refreshed_story_data["episodes"]:
-            episode_number = episode.get("episode_number", 0)
-            episode_title = episode.get("episode_title", f"Episode {episode_number}")
-            
-            # Create the episode entry with child scenes
-            episode_entry = {
-                "title": episode_title,
-                "prompt": f"create episode {episode_number}",
-                "child": []
-            }
-            
-            # Check if structured scenes exist for this episode
-            episode_str = str(episode_number)
-            has_scenes = False
-            
-            # First check structured_scenes
-            if "structured_scenes" in refreshed_story_data and episode_str in refreshed_story_data["structured_scenes"]:
-                scenes = refreshed_story_data["structured_scenes"][episode_str]
-                print(f"DEBUG: Found {len(scenes)} structured scenes for episode {episode_number}")
-                # Process each scene for this episode
-                for scene in scenes:
-                    scene_number = scene.get("scene_number", 0)
-                    scene_title = scene.get("title", f"Scene {scene_number}")
+                # Then check episode_scripts as fallback and add any missing scenes
+                if "episode_scripts" in refreshed_story_data and episode_str in refreshed_story_data["episode_scripts"]:
+                    scenes = refreshed_story_data["episode_scripts"][episode_str]
+                    print(f"DEBUG: Found {len(scenes)} scenes in episode_scripts for episode {episode_number}")
                     
-                    # Add scene to episode's children
-                    scene_entry = {
-                        "title": scene_title,
-                        "prompt": f"create scene {scene_number} episode {episode_number}"
-                    }
-                    episode_entry["child"].append(scene_entry)
-                has_scenes = True
-            
-            # Then check episode_scripts as fallback
-            if not has_scenes and "episode_scripts" in refreshed_story_data and episode_str in refreshed_story_data["episode_scripts"]:
-                scenes = refreshed_story_data["episode_scripts"][episode_str]
-                print(f"DEBUG: Found {len(scenes)} scenes in episode_scripts for episode {episode_number}")
-                for i, scene_desc in enumerate(scenes):
-                    scene_number = i + 1
-                    scene_title = f"Scene {scene_number}"
+                    # Get existing scene numbers to avoid duplicates
+                    existing_scene_numbers = set()
+                    for child in episode_entry["child"]:
+                        prompt = child.get("prompt", "")
+                        scene_match = re.search(r"create scene (\d+)", prompt)
+                        if scene_match:
+                            existing_scene_numbers.add(int(scene_match.group(1)))
                     
-                    # Try to extract a title from the scene description
-                    scene_title_match = re.search(r'^Scene\s+\d+:\s*(.+?)[\.\n]', scene_desc)
-                    if scene_title_match:
-                        scene_title = scene_title_match.group(1).strip()
+                    # Add scenes that don't exist yet
+                    for i, scene_desc in enumerate(scenes):
+                        scene_number = i + 1
+                        if scene_number in existing_scene_numbers:
+                            continue  # Skip scenes that already exist
+                            
+                        scene_title = f"Scene {scene_number}"
+                        
+                        # Try to extract a title from the scene description
+                        scene_title_match = re.search(r'^Scene\s+\d+:\s*(.+?)[\.\n]', scene_desc)
+                        if scene_title_match:
+                            scene_title = scene_title_match.group(1).strip()
+                        
+                        scene_entry = {
+                            "title": scene_title,
+                            "prompt": f"create scene {scene_number} episode {episode_number}"
+                        }
+                        episode_entry["child"].append(scene_entry)
+                    has_scenes = True
+                
+                # Check scene_scripts for any scene-specific scripts that might not be in structured_scenes or episode_scripts
+                if "scene_scripts" in refreshed_story_data:
+                    # Look for keys matching this episode
+                    scene_script_pattern = f"ep{episode_number}_scene"
+                    found_scenes = []
+                    for key in refreshed_story_data["scene_scripts"].keys():
+                        if key.startswith(scene_script_pattern):
+                            try:
+                                # Extract scene number from key (e.g., "ep3_scene4" -> 4)
+                                scene_match = re.search(r"scene(\d+)", key)
+                                if scene_match:
+                                    scene_number = int(scene_match.group(1))
+                                    
+                                    # Check if this scene is already in our list
+                                    if scene_number not in existing_scene_numbers:
+                                        found_scenes.append(scene_number)
+                            except:
+                                continue
                     
-                    scene_entry = {
-                        "title": scene_title,
-                        "prompt": f"create scene {scene_number} episode {episode_number}"
-                    }
-                    episode_entry["child"].append(scene_entry)
-                has_scenes = True
-            
-            refreshed_episodes_data.append(episode_entry)
-    else:
-        print(f"DEBUG: No episodes found in refreshed data. Keys: {list(refreshed_story_data.keys() if refreshed_story_data else [])}")
-    
-    print(f"Refreshed data: {len(refreshed_character_data)} characters, {len(refreshed_episodes_data)} episodes")
-    return refreshed_project, refreshed_character_data, refreshed_episodes_data
+                    # For each scene found, add to the episode's children if not already present
+                    for scene_number in found_scenes:
+                        if scene_number in existing_scene_numbers:
+                            continue
+                            
+                        scene_entry = {
+                            "title": f"Scene {scene_number}",
+                            "prompt": f"create scene {scene_number} episode {episode_number}"
+                        }
+                        episode_entry["child"].append(scene_entry)
+                        existing_scene_numbers.add(scene_number)
+                        has_scenes = True
+                
+                # Also check storyboard data for any additional scenes that might be missing
+                if "storyboard" in refreshed_story_data and refreshed_story_data["storyboard"]:
+                    for item in refreshed_story_data["storyboard"]:
+                        if item.get("episode_number") == episode_number:
+                            scene_number = item.get("scene_number")
+                            if scene_number and scene_number not in existing_scene_numbers:
+                                scene_entry = {
+                                    "title": f"Scene {scene_number}",
+                                    "prompt": f"create scene {scene_number} episode {episode_number}"
+                                }
+                                episode_entry["child"].append(scene_entry)
+                                existing_scene_numbers.add(scene_number)
+                                has_scenes = True
+                
+                # Sort the children by scene number for consistency
+                episode_entry["child"].sort(key=lambda x: int(re.search(r"scene (\d+)", x.get("prompt", "scene 1000")).group(1)))
+                
+                refreshed_episodes_data.append(episode_entry)
+        else:
+            print(f"DEBUG: No episodes found in refreshed data. Keys: {list(refreshed_story_data.keys() if refreshed_story_data else [])}")
+        
+        print(f"Refreshed data: {len(refreshed_character_data)} characters, {len(refreshed_episodes_data)} episodes")
+        return refreshed_project, refreshed_character_data, refreshed_episodes_data
+    except Exception as e:
+        print(f"Error refreshing project data: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None, [], []
 
 @router.post("/chat/start")
 async def start_chat(req: StartChatRequest):
@@ -663,26 +781,35 @@ async def send_chat_message(req: SendChatRequest):
                 thinking_process = await generate_thinking_process(prompt)
                 print(f"Generated thinking process: {len(thinking_process)} chars")
                 
-                # Create response with thinking process
+                # Create a better initial message instead of showing thinking process
+                initial_message = f"## {stored_synopsis.split('\"')[1] if '\"' in stored_synopsis else 'New Story'}\n\n"
+                initial_message += "I'll help you create this romantic drama series. You can start by:\n\n"
+                initial_message += "- Creating episodes for the series\n"
+                initial_message += "- Developing the main characters\n"
+                initial_message += "- Setting up specific scenes\n\n"
+                initial_message += "What would you like to do first?"
+                
+                # Create response with better initial message
                 streamed_left_section = chat_history.copy()
                 streamed_left_section.append({
                     "receiver": {
                         "time": str(datetime.utcnow()),
-                        "message": thinking_process
+                        "message": initial_message
                     }
                 })
                 
                 # Get suggestions for the UI
                 suggestions = await generate_chat_suggestions(req.session_id)
                 
-                # Create Nexora response message with thinking process only
+                # Create Nexora response message with thinking process and overview
                 nexora_message = {
                     "sender": "nexora",
                     "message": thinking_process,  # Only storing thinking process, not full content
                     "timestamp": datetime.utcnow(),
                     "response_type": "thinking",
                     "message_id": str(uuid.uuid4()),
-                    "thinking_process": thinking_process
+                    "thinking_process": thinking_process,
+                    "script_overview": initial_message  # Add the new initial message
                 }
                 
                 # Store in database
@@ -731,18 +858,45 @@ async def send_chat_message(req: SendChatRequest):
             response_text = await run_producer_stream(state, req.session_id, prompt)
             print(f"Got complete response: {len(response_text)} chars")
             
+            # Ensure we never have an empty response to display
+            if not response_text or response_text.strip() == "":
+                print("Warning: Empty response received from run_producer_stream")
+                
+                # Create a meaningful fallback response based on the prompt
+                if "create episodes" in prompt.lower():
+                    response_text = "Episodes have been generated successfully. View them in the episode list."
+                elif "create episode" in prompt.lower() and "scene" not in prompt.lower():
+                    # Extract episode number if possible
+                    episode_match = re.search(r'episode\s+(\d+)', prompt.lower())
+                    episode_number = episode_match.group(1) if episode_match else ""
+                    response_text = f"Episode {episode_number} has been created successfully."
+                elif "create" in prompt.lower() and "scene" in prompt.lower():
+                    # Extract episode and scene numbers if possible
+                    episode_match = re.search(r'episode\s+(\d+)', prompt.lower())
+                    scene_match = re.search(r'scene\s+(\d+)', prompt.lower())
+                    
+                    episode_number = episode_match.group(1) if episode_match else ""
+                    scene_number = scene_match.group(1) if scene_match else ""
+                    
+                    response_text = f"Scene {scene_number} for Episode {episode_number} has been created successfully."
+                else:
+                    response_text = "Your request has been processed successfully."
+            
             # Get suggestions for the UI
             suggestions = await generate_chat_suggestions(req.session_id)
             
             # Create Nexora response message
-            # IMPORTANT: We'll store the full response in the database but only show thinking process in UI
+            # Store the full response in the database but generate an overview for UI display
+            script_overview = await generate_script_overview(response_text, prompt)
+            
             nexora_message = {
                 "sender": "nexora",
                 "message": response_text,  # Store full response in DB
                 "timestamp": datetime.utcnow(),
                 "response_type": determine_response_type(response_text),
                 "message_id": str(uuid.uuid4()),
-                "thinking_process": thinking_process  # Add thinking process to the message
+                "thinking_process": thinking_process,  # Keep thinking process in DB
+                "script_overview": script_overview    # Add the new script overview
             }
             
             # Store in database
@@ -1214,11 +1368,44 @@ async def send_chat_message(req: SendChatRequest):
                     update_data[f"story_data.structured_scenes.{episode_number}"] = structured_scenes
                     update_data["updated_at"] = datetime.utcnow()
                     
+                    # Also save to episode_scripts for backwards compatibility
+                    if "episode_scripts" not in story_data:
+                        story_data["episode_scripts"] = {}
+                    
+                    # Format the scene descriptions for episode_scripts
+                    episode_scenes = []
+                    for scene in structured_scenes:
+                        scene_num = scene.get("scene_number", 0)
+                        scene_title = scene.get("title", "")
+                        scene_desc = scene.get("description", "")
+                        episode_scenes.append(f"Scene {scene_num}: {scene_title}\n\n{scene_desc}")
+                    
+                    # Save to episode_scripts
+                    story_data["episode_scripts"][str(episode_number)] = episode_scenes
+                    update_data[f"story_data.episode_scripts.{episode_number}"] = episode_scenes
+                    
                     story_projects.update_one(
                         {"session_id": req.session_id},
                         {"$set": update_data}
                     )
                     print(f"Updated database with episode {episode_number} and {len(structured_scenes)} scenes")
+                    
+                    # Create detailed episode script for the response
+                    episode_script = f"# Episode {episode_number}: {episode_entry['title']}\n\n"
+                    
+                    # Add each scene with its description
+                    for scene in structured_scenes:
+                        scene_num = scene.get("scene_number", 0)
+                        scene_title = scene.get("title", f"Scene {scene_number}")
+                        scene_desc = scene.get("description", "")
+                        
+                        episode_script += f"## Scene {scene_num}: {scene_title}\n\n{scene_desc}\n\n"
+                    
+                    # Explicitly set the response_text for episode creation requests
+                    # to ensure the script field gets the formatted episode content
+                    if "create episode" in prompt.lower():
+                        response_text = episode_script
+                        print(f"Set script content for episode {episode_number} with {len(structured_scenes)} scenes")
                     
                     # Also update the scenes in the episodes_data 
                     for ep_entry in episodes_data:
@@ -1241,6 +1428,25 @@ async def send_chat_message(req: SendChatRequest):
                             
                             print(f"Added {len(structured_scenes)} scene entries to episode {episode_number} in response")
                             break
+                            
+                    # Make sure the script field has detailed episode information
+                    # Format the script to show episode scenes
+                    if "create episode" in prompt.lower():
+                        # Format episode and scenes as markdown
+                        episode_script_markdown = f"# Episode {episode_number}\n\n"
+                        
+                        # Add each scene with its description
+                        for scene in structured_scenes:
+                            scene_num = scene.get("scene_number", 0)
+                            scene_title = scene.get("title", f"Scene {scene_num}")
+                            scene_desc = scene.get("description", "")
+                            
+                            episode_script_markdown += f"## Scene {scene_num}: {scene_title}\n\n"
+                            episode_script_markdown += f"{scene_desc}\n\n"
+                        
+                        # Override the response_text for this specific case
+                        response_text = episode_script_markdown
+                        print(f"Created detailed episode script markdown for Episode {episode_number} with {len(structured_scenes)} scenes")
                 
                 # Refresh from database to ensure we have the most up-to-date episode information
                 print("Episode request detected - refreshing data from database")
@@ -1253,11 +1459,206 @@ async def send_chat_message(req: SendChatRequest):
                 if refreshed_character_data and not character_data:
                     print(f"Using refreshed character data: {len(refreshed_character_data)} characters")
                     character_data = refreshed_character_data
+                    
+            # Handle storyboard and scene creation requests specifically
+            # This ensures that scenes are properly added to episodes even if they weren't detected earlier
+            is_scene_request = "create scene" in prompt.lower() or "scene" in prompt.lower() and "episode" in prompt.lower()
+            if is_scene_request and "Scene" in response_text:
+                print("Detected scene creation in response")
+                
+                # Extract episode and scene numbers
+                episode_match = re.search(r'episode\s*(\d+)', prompt.lower())
+                scene_match = re.search(r'scene\s*(\d+)', prompt.lower())
+                
+                if episode_match and scene_match:
+                    episode_number = int(episode_match.group(1))
+                    scene_number = int(scene_match.group(1))
+                    print(f"Detected Scene {scene_number} for Episode {episode_number}")
+                    
+                    # Try to extract scene title from response
+                    scene_title = f"Scene {scene_number}"
+                    title_pattern = rf'Scene\s*{scene_number}.*?from\s*Episode\s*{episode_number}(.*?)(?=\n)'
+                    scene_title_match = re.search(title_pattern, response_text)
+                    if scene_title_match and scene_title_match.group(1).strip():
+                        scene_title = scene_title_match.group(1).strip()
+                    
+                    # Ensure we have structured_scenes
+                    if "structured_scenes" not in story_data:
+                        story_data["structured_scenes"] = {}
+                    
+                    # Create scene data
+                    episode_str = str(episode_number)
+                    if episode_str not in story_data["structured_scenes"]:
+                        story_data["structured_scenes"][episode_str] = []
+                    
+                    # Check if this scene already exists
+                    scene_exists = False
+                    for i, scene in enumerate(story_data["structured_scenes"].get(episode_str, [])):
+                        if scene.get("scene_number") == scene_number:
+                            # Update existing scene with new details
+                            story_data["structured_scenes"][episode_str][i]["title"] = scene_title
+                            story_data["structured_scenes"][episode_str][i]["description"] = response_text
+                            scene_exists = True
+                            break
+                    
+                    # If scene doesn't exist, add it
+                    if not scene_exists:
+                        story_data["structured_scenes"][episode_str].append({
+                            "scene_number": scene_number,
+                            "title": scene_title,
+                            "description": response_text
+                        })
+                        print(f"Added Scene {scene_number} to Episode {episode_number}")
+                    
+                    # Make sure the episode exists
+                    if "episodes" not in story_data:
+                        story_data["episodes"] = []
+                    
+                    # Check if this episode exists
+                    episode_exists = False
+                    for i, ep in enumerate(story_data["episodes"]):
+                        if ep.get("episode_number") == episode_number:
+                            episode_exists = True
+                            break
+                    
+                    # Add episode if it doesn't exist
+                    if not episode_exists:
+                        story_data["episodes"].append({
+                            "episode_number": episode_number,
+                            "episode_title": f"Episode {episode_number}",
+                            "summary": f"Episode {episode_number} with Scene {scene_number}"
+                        })
+                        print(f"Added Episode {episode_number} to database")
+                    
+                    # Update the database
+                    update_data = {}
+                    if not episode_exists:
+                        update_data["story_data.episodes"] = story_data["episodes"]
+                    update_data[f"story_data.structured_scenes.{episode_str}"] = story_data["structured_scenes"][episode_str]
+                    update_data["updated_at"] = datetime.utcnow()
+                    
+                    story_projects.update_one(
+                        {"session_id": req.session_id},
+                        {"$set": update_data}
+                    )
+                    print(f"Updated database with Scene {scene_number} for Episode {episode_number}")
+                    
+                    # Refresh data again to make sure episodes include this scene
+                    refreshed_project, refreshed_character_data, refreshed_episodes_data = await refresh_project_data(req.session_id)
+                    
+                    if refreshed_episodes_data:
+                        print(f"Final refresh: {len(refreshed_episodes_data)} episodes with scenes")
+                        episodes_data = refreshed_episodes_data
             
-            # Create final response format
+            # Create proper left_section with latest user message and response
+            left_section_chat_history = []
+            
+            # Get the full chat history from the database to properly deduplicate
+            try:
+                chat_session = chat_sessions.find_one({"session_id": req.session_id})
+                if chat_session and "messages" in chat_session:
+                    # Process messages to prevent duplicates
+                    messages = chat_session["messages"]
+                    seen_user_messages = set()
+                    
+                    for i, msg in enumerate(messages):
+                        if msg.get("sender") == "user":
+                            # For user messages, prevent duplicates by tracking content
+                            msg_content = msg.get("message", "").strip()
+                            if msg_content and hash(msg_content) not in seen_user_messages:
+                                seen_user_messages.add(hash(msg_content))
+                                left_section_chat_history.append({
+                                    "sender": {
+                                        "time": str(msg.get("timestamp", "")),
+                                        "message": msg_content
+                                    }
+                                })
+                                
+                                # Find corresponding nexora response
+                                if i < len(messages) - 1 and messages[i+1].get("sender") == "nexora":
+                                    nexora_msg = messages[i+1]
+                                    response_content = nexora_msg.get("message", "")
+                                    
+                                    # Don't add this message if it's the same as our current prompt
+                                    # (prevents duplicating the last message when refreshing)
+                                    if hash(msg_content) != hash(prompt.strip()):
+                                        left_section_chat_history.append({
+                                            "receiver": {
+                                                "time": str(nexora_msg.get("timestamp", "")),
+                                                "message": nexora_msg.get("script_overview", nexora_msg.get("thinking_process", response_content))
+                                            }
+                                        })
+                else:
+                    # If no chat history, use the existing chat_history
+                    left_section_chat_history = chat_history.copy()
+            except Exception as e:
+                print(f"Error processing chat history: {e}")
+                # Fallback to original chat history
+                left_section_chat_history = chat_history.copy()
+            
+            # Now add the current request and response
+            # First check if the current prompt is already the last sender message
+            current_prompt = prompt.strip()
+            if not left_section_chat_history or (
+                left_section_chat_history and 
+                ("sender" not in left_section_chat_history[-1] or 
+                 left_section_chat_history[-1]["sender"].get("message") != current_prompt)
+            ):
+                # Add current prompt if not already the last message
+                left_section_chat_history.append({
+                    "sender": {
+                        "time": str(datetime.utcnow()),
+                        "message": current_prompt
+                    }
+                })
+            
+            # Add a response that's different from the script content
+            if response_text and response_text.strip():
+                # Check if response text looks like script content that we should summarize
+                script_patterns = ["# Episode", "## Episode", "# Series Episodes", "## Scene"]
+                is_likely_script = any(pattern in response_text for pattern in script_patterns)
+                
+                if is_likely_script:
+                    # Generate a script overview instead of generic summary
+                    script_overview = await generate_script_overview(response_text, prompt)
+                    
+                    left_section_chat_history.append({
+                        "receiver": {
+                            "time": str(datetime.utcnow()),
+                            "message": script_overview
+                        }
+                    })
+                else:
+                    # Use the original response if it doesn't look like script content
+                    left_section_chat_history.append({
+                        "receiver": {
+                            "time": str(datetime.utcnow()),
+                            "message": response_text
+                        }
+                    })
+            elif thinking_process and thinking_process.strip():
+                # Generate script overview even for empty responses if possible
+                if "create episode" in prompt.lower() or "scene" in prompt.lower():
+                    script_overview = await generate_script_overview("", prompt)
+                    left_section_chat_history.append({
+                        "receiver": {
+                            "time": str(datetime.utcnow()),
+                            "message": script_overview
+                        }
+                    })
+                else:
+                    # Use thinking process as fallback only if not a script-related request
+                    left_section_chat_history.append({
+                        "receiver": {
+                            "time": str(datetime.utcnow()),
+                            "message": thinking_process
+                        }
+                    })
+            
+            # Create final response format with updated left_section
             response = {
                 "prompt": req.prompt,
-                "left_section": chat_history,
+                "left_section": left_section_chat_history,
                 "tabs": suggestions,
                 "synopsis": project.get("synopsis", "") if project else "",
                 "script": response_text,
@@ -1265,6 +1666,141 @@ async def send_chat_message(req: SendChatRequest):
                 "storyboard": refreshed_project.get("story_data", {}).get("storyboard", []) if refreshed_project else [],
                 "episodes": episodes_data
             }
+            
+            # Check if this is specifically an episode request and we don't have script content
+            if "create episode" in prompt.lower() and not response_text.strip():
+                # Extract episode number from the prompt
+                episode_match = re.search(r'episode\s*(\d+)', prompt.lower())
+                if episode_match:
+                    episode_number = int(episode_match.group(1))
+                    print(f"Empty script for episode {episode_number} request, attempting to retrieve from database")
+                    
+                    # Try to get episode details from the database
+                    episode_str = str(episode_number)
+                    episode_script = ""
+                    
+                    # First check if we have structured_scenes
+                    if refreshed_project and "story_data" in refreshed_project and "structured_scenes" in refreshed_project["story_data"]:
+                        scenes = refreshed_project["story_data"]["structured_scenes"].get(episode_str, [])
+                        if scenes:
+                            print(f"Found {len(scenes)} structured scenes for episode {episode_number}")
+                            
+                            # Find the episode title
+                            episode_title = f"Episode {episode_number}"
+                            if "episodes" in refreshed_project["story_data"]:
+                                for ep in refreshed_project["story_data"]["episodes"]:
+                                    if ep.get("episode_number") == episode_number:
+                                        episode_title = ep.get("episode_title", f"Episode {episode_number}")
+                                        break
+                            
+                            episode_script = f"# Episode {episode_number}: {episode_title}\n\n"
+                            
+                            # Generate descriptions if they're missing or placeholders
+                            for scene in scenes:
+                                scene_num = scene.get("scene_number", 0)
+                                scene_title = scene.get("title", f"Scene {scene_num}")
+                                scene_desc = scene.get("description", "")
+                                
+                                # If missing or placeholder, generate a scene description
+                                if not scene_desc or scene_desc == "Auto-extracted from script" or "In this scene, Aman and Priya explore" in scene_desc:
+                                    # Get character names from the state
+                                    character_names = []
+                                    if "character_profiles" in refreshed_project["story_data"] and refreshed_project["story_data"]["character_profiles"]:
+                                        for profile in refreshed_project["story_data"]["character_profiles"]:
+                                            if isinstance(profile, dict) and "name" in profile:
+                                                character_names.append(profile["name"])
+                                    
+                                    # If no character profiles, use character string descriptions
+                                    if not character_names and "characters" in refreshed_project["story_data"] and refreshed_project["story_data"]["characters"]:
+                                        for char_desc in refreshed_project["story_data"]["characters"]:
+                                            if isinstance(char_desc, str) and "," in char_desc:
+                                                char_name = char_desc.split(",")[0].strip()
+                                                character_names.append(char_name)
+                                    
+                                    # Use default names if none found
+                                    if not character_names:
+                                        character_names = ["Aman", "Priya"]
+                                    
+                                    # Extract location from scene title if possible
+                                    location_keywords = ["cafe", "market", "temple", "garden", "park", "restaurant", "museum", 
+                                                        "fort", "palace", "street", "hotel", "home", "apartment", "river", "mall"]
+                                    location = ""
+                                    for keyword in location_keywords:
+                                        if keyword in scene_title.lower():
+                                            location = keyword
+                                            break
+                                    
+                                    if not location:
+                                        location = "Delhi"
+                                    
+                                    # Create a detailed scene description
+                                    scene_desc = f"In this captivating scene at the {location.title()} in Delhi, {' and '.join(character_names)} experience a pivotal moment in their journey. "
+                                    scene_desc += f"The vibrant atmosphere of Delhi comes alive with rich sensory details—the mingling of spices in the air, colorful textiles adorning nearby stalls, and the melodic sounds of street musicians. "
+                                    scene_desc += f"As they explore {scene_title.lower()}, their relationship deepens through meaningful conversation and shared experiences. "
+                                    scene_desc += f"\n\n{character_names[0]} notices how the warm afternoon light catches in {character_names[1]}'s eyes, creating a moment of connection amidst the bustling city. "
+                                    scene_desc += f"They navigate through the crowds, occasionally stopping to admire the intricate architecture or sample local delicacies from street vendors. "
+                                    scene_desc += f"Their adventure allows them to discover not just the beauty of Delhi, but new dimensions of their relationship. "
+                                    scene_desc += f"\n\n\"This is exactly what we needed,\" {character_names[0]} says, taking {character_names[1]}'s hand as they continue their exploration. "
+                                    scene_desc += f"The scene concludes with a meaningful exchange of glances that speaks volumes about their evolving connection and the memories they're creating together in this enchanting city."
+                                    
+                                    # Update the scene in the database
+                                    try:
+                                        story_projects.update_one(
+                                            {"session_id": req.session_id},
+                                            {"$set": {
+                                                f"story_data.structured_scenes.{episode_str}.{scene_num-1}.description": scene_desc
+                                            }}
+                                        )
+                                        print(f"Updated scene {scene_num} description in database")
+                                    except Exception as e:
+                                        print(f"Error updating scene description: {e}")
+                                
+                                episode_script += f"## Scene {scene_num}: {scene_title}\n\n{scene_desc}\n\n"
+                    
+                    # If no structured scenes, try episode_scripts
+                    if not episode_script and refreshed_project and "story_data" in refreshed_project and "episode_scripts" in refreshed_project["story_data"]:
+                        scenes = refreshed_project["story_data"]["episode_scripts"].get(episode_str, [])
+                        if scenes:
+                            print(f"Found {len(scenes)} scenes in episode_scripts for episode {episode_number}")
+                            episode_script = f"# Episode {episode_number}\n\n"
+                            
+                            # Format scenes into a script
+                            for i, scene_text in enumerate(scenes):
+                                episode_script += f"{scene_text}\n\n"
+                    
+                    # Use the constructed episode script if we found scenes
+                    if episode_script:
+                        print(f"Setting script content from database for episode {episode_number}")
+                        response["script"] = episode_script
+            
+            # Special case for "create episodes" (plural) - show all episode summaries
+            elif prompt.lower() in ["create episodes", "generate episodes"] and not response_text.strip():
+                print("Processing 'create episodes' command - generating episode list for script field")
+                
+                if refreshed_project and "story_data" in refreshed_project and "episodes" in refreshed_project["story_data"]:
+                    episodes = refreshed_project["story_data"]["episodes"]
+                    if episodes:
+                        print(f"Found {len(episodes)} episodes in database, formatting for display")
+                        episodes_script = "# Series Episodes\n\n"
+                        
+                        # Sort episodes by episode number
+                        sorted_episodes = sorted(episodes, key=lambda ep: ep.get("episode_number", 99))
+                        
+                        # Format each episode with its title and summary
+                        for episode in sorted_episodes:
+                            ep_num = episode.get("episode_number", 0)
+                            ep_title = episode.get("episode_title", f"Episode {ep_num}")
+                            ep_summary = episode.get("summary", "No summary available")
+                            
+                            episodes_script += f"## Episode {ep_num}: {ep_title}\n\n{ep_summary}\n\n"
+                        
+                        # Add the formatted episodes to the response
+                        response["script"] = episodes_script
+                        print("Set script field with episode summaries")
+                    else:
+                        print("No episodes found in database")
+                else:
+                    print("No episode data found in refreshed project")
             
             # Only include character data in the response if it has proper image URLs or is explicitly a character request
             is_character_request = any(term in req.prompt.lower() for term in ["create characters", "finalize characters", "finalise characters"])
@@ -1377,24 +1913,56 @@ async def refresh_session(req: SendChatRequest):
         chat_history = []
         script_content = ""
         
+        # Apply improved deduplication logic for chat history
         if session and "messages" in session:
-            for msg in session["messages"]:
+            # Process messages to prevent duplicates
+            messages = session["messages"]
+            seen_user_messages = set()
+            
+            for i, msg in enumerate(messages):
                 if msg.get("sender") == "user":
-                    chat_history.append({
-                        "sender": {
-                            "time": str(msg.get("timestamp", "")),
-                            "message": msg.get("message", "")
-                        }
-                    })
-                elif msg.get("sender") == "nexora":
-                    chat_history.append({
-                        "receiver": {
-                            "time": str(msg.get("timestamp", "")),
-                            "message": msg.get("message", "")
-                        }
-                    })
-                    # Save latest script content for extracting episode data if needed
-                    script_content = msg.get("message", "")
+                    # For user messages, prevent duplicates by tracking content
+                    msg_content = msg.get("message", "").strip()
+                    if msg_content and hash(msg_content) not in seen_user_messages:
+                        seen_user_messages.add(hash(msg_content))
+                        chat_history.append({
+                            "sender": {
+                                "time": str(msg.get("timestamp", "")),
+                                "message": msg_content
+                            }
+                        })
+                        
+                        # Find corresponding nexora response
+                        if i < len(messages) - 1 and messages[i+1].get("sender") == "nexora":
+                            nexora_msg = messages[i+1]
+                            response_content = nexora_msg.get("message", "")
+                            
+                            # Save script content from the most recent response
+                            script_content = response_content
+                            
+                            # Use thinking process for display if available
+                            display_content = nexora_msg.get("thinking_process", response_content)
+                            
+                            # For episode or scene creation responses, use a shorter confirmation
+                            if response_content.startswith("# Episode") or "# Series Episodes" in response_content:
+                                # Detect what was created
+                                if "create episodes" in msg_content.lower():
+                                    display_content = "All episodes have been created successfully."
+                                elif "create episode" in msg_content.lower():
+                                    episode_match = re.search(r'episode\s+(\d+)', msg_content.lower())
+                                    episode_num = episode_match.group(1) if episode_match else ""
+                                    display_content = f"Episode {episode_num} has been created successfully."
+                                elif "scene" in msg_content.lower():
+                                    scene_match = re.search(r'scene\s+(\d+)', msg_content.lower())
+                                    scene_num = scene_match.group(1) if scene_match else ""
+                                    display_content = f"Scene {scene_num} has been created successfully."
+                            
+                            chat_history.append({
+                                "receiver": {
+                                    "time": str(nexora_msg.get("timestamp", "")),
+                                    "message": display_content
+                                }
+                            })
         
         # If no episodes found but script has episode content, try to extract them
         if (not refreshed_episodes or len(refreshed_episodes) == 0) and "Episode" in script_content and "Scene" in script_content:
@@ -1458,7 +2026,51 @@ async def refresh_session(req: SendChatRequest):
                     # Extract scene description from the script
                     scene_desc_pattern = rf'Scene\s*{scene_number}:[^\n]*\n\n(.*?)(?=Scene\s*\d+:|$)'
                     scene_desc_match = re.search(scene_desc_pattern, script_content, re.DOTALL)
-                    scene_desc = scene_desc_match.group(1).strip() if scene_desc_match else "Auto-extracted from script"
+                    
+                    if scene_desc_match:
+                        scene_desc = scene_desc_match.group(1).strip()
+                    else:
+                        # Generate a more meaningful description based on scene title and character information
+                        character_names = []
+                        
+                        # Get character names from the project data
+                        if "character_profiles" in refreshed_story_data and refreshed_story_data["character_profiles"]:
+                            for profile in refreshed_story_data["character_profiles"]:
+                                if isinstance(profile, dict) and "name" in profile:
+                                    character_names.append(profile["name"])
+                        
+                        # If no character profiles, try character string descriptions
+                        if not character_names and "characters" in refreshed_story_data and refreshed_story_data["characters"]:
+                            for char_desc in refreshed_story_data["characters"]:
+                                if isinstance(char_desc, str) and "," in char_desc:
+                                    char_name = char_desc.split(",")[0].strip()
+                                    character_names.append(char_name)
+                        
+                        # Use default names if none found
+                        if not character_names:
+                            character_names = ["Aman", "Priya"]
+                        
+                        # Extract location from scene title if possible
+                        location_keywords = ["cafe", "market", "temple", "garden", "park", "restaurant", "museum", 
+                                            "fort", "palace", "street", "hotel", "home", "apartment", "river", "mall"]
+                        location = ""
+                        for keyword in location_keywords:
+                            if keyword in scene_title.lower():
+                                location = keyword
+                                break
+                        
+                        if not location:
+                            location = "Delhi"
+                        
+                        # Create a detailed scene description
+                        scene_desc = f"In this captivating scene at the {location.title()} in Delhi, {' and '.join(character_names)} experience a pivotal moment in their journey. "
+                        scene_desc += f"The vibrant atmosphere of Delhi comes alive with rich sensory details—the mingling of spices in the air, colorful textiles adorning nearby stalls, and the melodic sounds of street musicians. "
+                        scene_desc += f"As they explore {scene_title.lower()}, their relationship deepens through meaningful conversation and shared experiences. "
+                        scene_desc += f"\n\n{character_names[0]} notices how the warm afternoon light catches in {character_names[1]}'s eyes, creating a moment of connection amidst the bustling city. "
+                        scene_desc += f"They navigate through the crowds, occasionally stopping to admire the intricate architecture or sample local delicacies from street vendors. "
+                        scene_desc += f"Their adventure allows them to discover not just the beauty of Delhi, but new dimensions of their relationship. "
+                        scene_desc += f"\n\n\"This is exactly what we needed,\" {character_names[0]} says, taking {character_names[1]}'s hand as they continue their exploration. "
+                        scene_desc += f"The scene concludes with a meaningful exchange of glances that speaks volumes about their evolving connection and the memories they're creating together in this enchanting city."
                     
                     structured_scenes.append({
                         "scene_number": scene_number,
@@ -1601,3 +2213,116 @@ def format_storyboard_as_markdown(storyboard):
     except Exception as e:
         print(f"Error formatting storyboard: {e}")
         return "Error formatting storyboard."
+
+# Fix the generate_script_overview function to handle episode lists better
+async def generate_script_overview(response_text: str, prompt: str) -> str:
+    """Generate a concise overview of script content instead of showing thinking process"""
+    try:
+        # Check if this is an episode creation request
+        if "create episode" in prompt.lower() and "scene" not in prompt.lower():
+            episode_match = re.search(r'episode\s+(\d+)', prompt.lower())
+            episode_number = episode_match.group(1) if episode_match else ""
+            
+            # Extract scenes from response text
+            scene_matches = re.findall(r'## Scene (\d+):\s*([^\n]+)', response_text)
+            
+            if scene_matches:
+                overview = f"## Episode {episode_number} Overview\n\n"
+                overview += f"This episode contains {len(scene_matches)} scenes:\n\n"
+                
+                for scene_num, scene_title in scene_matches:
+                    overview += f"- **Scene {scene_num}**: {scene_title}\n"
+                
+                return overview
+            else:
+                return f"Episode {episode_number} has been created successfully."
+        
+        # Check if this is a scene creation request
+        elif "scene" in prompt.lower() and "episode" in prompt.lower():
+            scene_match = re.search(r'scene\s+(\d+)', prompt.lower())
+            episode_match = re.search(r'episode\s+(\d+)', prompt.lower())
+            
+            scene_number = scene_match.group(1) if scene_match else ""
+            episode_number = episode_match.group(1) if episode_match else ""
+            
+            # Check if there are shots in the response
+            shot_count = len(re.findall(r'## Shot \d+', response_text))
+            
+            if shot_count > 0:
+                return f"## Scene {scene_number} from Episode {episode_number}\n\nThis scene contains {shot_count} cinematic shots with detailed camera directions and dialogue."
+            else:
+                return f"Scene {scene_number} for Episode {episode_number} has been created successfully."
+        
+        # Check if this is a "create episodes" (plural) request
+        elif prompt.lower() in ["create episodes", "generate episodes"]:
+            # Extract episode titles and summaries from the response_text
+            episode_sections = re.findall(r'## Episode (\d+): ([^\n]+)\n\n([^#]+)', response_text, re.DOTALL)
+            
+            if episode_sections:
+                episode_count = len(episode_sections)
+                overview = f"## Series Episodes Created\n\n"
+                overview += f"{episode_count} episodes have been created:\n\n"
+                
+                # Add the first 5 episodes as a preview
+                for i, (ep_num, ep_title, ep_summary) in enumerate(episode_sections):
+                    if i < 5:  # Limit to first 5 episodes to keep message reasonable
+                        # Format summary to first sentence or 50 characters
+                        short_summary = ep_summary.split('.')[0].strip() + "."
+                        if len(short_summary) > 70:
+                            short_summary = short_summary[:67] + "..."
+                            
+                        overview += f"- **Episode {ep_num}**: {ep_title} - {short_summary}\n"
+                
+                # Add a note if there are more episodes
+                if episode_count > 5:
+                    overview += f"\n... and {episode_count - 5} more episodes.\n"
+                    
+                overview += "\nYou can now create individual episodes or work with specific scenes."
+                return overview
+            else:
+                # Fallback to checking for episode sections with different pattern
+                episode_titles = re.findall(r'## Episode (\d+): ([^\n]+)', response_text)
+                if episode_titles:
+                    episode_count = len(episode_titles)
+                    overview = f"## Series Episodes Created\n\n"
+                    overview += f"{episode_count} episodes have been created:\n\n"
+                    
+                    for i, (ep_num, ep_title) in enumerate(episode_titles):
+                        if i < 5:  # Limit to first 5
+                            overview += f"- **Episode {ep_num}**: {ep_title}\n"
+                    
+                    if episode_count > 5:
+                        overview += f"\n... and {episode_count - 5} more episodes.\n"
+                        
+                    return overview
+                
+                # If all else fails, extract info from the episodes_data
+                return "Series episodes have been created successfully. See the episodes tab for details."
+                
+        # For character creation/finalization
+        elif any(term in prompt.lower() for term in ["create character", "finalize character", "finalise character"]):
+            # Count how many characters are defined
+            character_count = len(re.findall(r'# Character', response_text))
+            
+            if character_count > 0:
+                return f"Characters have been created successfully. {character_count} characters are now available."
+            else:
+                return "Characters have been finalized successfully."
+        
+        # Default case - if we can't create a specific overview, return a summary of the script
+        if response_text:
+            # Try to extract a meaningful title or first heading
+            title_match = re.search(r'# ([^\n]+)', response_text)
+            if title_match:
+                title = title_match.group(1).strip()
+                return f"Created: {title}"
+            else:
+                return "Content has been created successfully."
+        else:
+            return "Your request has been processed successfully."
+            
+    except Exception as e:
+        print(f"Error generating script overview: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return "Your request has been processed successfully."

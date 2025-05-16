@@ -397,23 +397,21 @@ Return your response in this JSON format:
         scenes_prompt = f"""
 {system_prompt}
 
-Break this episode into 6-8 scenes with detailed action and dialogue.
-Use only 1-2 characters per scene.
+Break this episode into 6-8 detailed scenes for a Hindi romantic drama series.
+Focus on the adventures of the couple in Delhi.
+For each scene, provide:
+1. A descriptive title
+2. A detailed description (2-3 paragraphs) showing the couple's journey and emotions
 
 Episode Title: {title}
 Episode Summary: {summary}
 
-Return your response in this JSON format:
-{{
-  "scenes": [
-    {{
-      "scene_number": 1,
-      "title": "Brief scene title",
-      "description": "Detailed scene description with action and dialogue"
-    }},
-    ...
-  ]
-}}
+Format each scene like this:
+Scene 1: [Scene Title] - [Full detailed description that includes setting, characters, actions, and dialogue]
+Scene 2: [Scene Title] - [Full detailed description]
+etc.
+
+Each scene description should be rich, evocative, and complete - no placeholders.
 """
 
         # Add character information to the prompt if available
@@ -424,10 +422,9 @@ Return your response in this JSON format:
             print(f"Found {len(state.character_profiles)} character profiles to use in episode script")
             for profile in state.character_profiles:
                 name = profile.get("name", "")
-                desc = profile.get("description", "")
                 if name:
                     character_names.append(name)
-                    scenes_prompt += f"\nCharacter: {name} - {desc[:100]}..."
+                    scenes_prompt += f"\nCharacter: {name}"
         
         # If no profiles found, try to get from characters list
         elif hasattr(state, "characters") and state.characters:
@@ -435,20 +432,8 @@ Return your response in this JSON format:
             for char in state.characters:
                 if isinstance(char, str) and ',' in char:
                     name = char.split(',')[0].strip()
-                    desc = char.split(',', 1)[1].strip() if len(char.split(',')) > 1 else ""
                     character_names.append(name)
-                    scenes_prompt += f"\nCharacter: {name} - {desc[:100]}..."
-        
-        # Also check for characters in story_data (where API stores them)
-        elif hasattr(state, "story_data") and isinstance(state.story_data, dict) and "character_profiles" in state.story_data:
-            char_profiles = state.story_data["character_profiles"]
-            print(f"Found {len(char_profiles)} character profiles in story_data")
-            for profile in char_profiles:
-                name = profile.get("name", "")
-                desc = profile.get("description", "")
-                if name:
-                    character_names.append(name)
-                    scenes_prompt += f"\nCharacter: {name} - {desc[:100]}..."
+                    scenes_prompt += f"\nCharacter: {name}"
         
         # If any character names were found, add a constraint to the prompt
         if character_names:
@@ -456,7 +441,6 @@ Return your response in this JSON format:
             scenes_prompt += f"""
 
 IMPORTANT: Use ONLY these character names in your scenes: {', '.join(character_names)}
-DO NOT invent or use any other main character names not in this list.
 """
 
         response = client.chat.completions.create(
@@ -465,88 +449,76 @@ DO NOT invent or use any other main character names not in this list.
             temperature=0.7
         )
         
-        # Parse the scenes
+        # Parse the response - expect a list of strings or simple text format with scene markers
         response_content = response.choices[0].message.content
         
-        # Extract JSON if in code block
-        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response_content)
-        if json_match:
-            scenes_json = json_match.group(1).strip()
-        else:
-            scenes_json = response_content
-            
-        parsed_response = safe_parse_json_string(scenes_json)
+        # We'll handle both structured and unstructured formats
+        # First try to extract scenes based on "Scene X:" markers
+        import re
+        scenes = re.findall(r'Scene\s+\d+:\s*(.*?)(?=Scene\s+\d+:|$)', response_content, re.DOTALL)
         
-        # Handle both structured and unstructured formats
-        if isinstance(parsed_response, dict) and "scenes" in parsed_response:
-            # New structured format
-            structured_scenes = parsed_response["scenes"]
+        if not scenes:
+            # Try to parse JSON if the response is in that format
+            try:
+                parsed_response = safe_parse_json_string(response_content)
+                if isinstance(parsed_response, list):
+                    scenes = parsed_response
+                elif isinstance(parsed_response, dict) and "scenes" in parsed_response:
+                    scenes = [f"{scene.get('title', '')}: {scene.get('description', '')}" 
+                             for scene in parsed_response["scenes"]]
+            except:
+                # Fallback - use the original response as a single scene
+                scenes = [response_content]
+        
+        # Clean up the scenes (remove extra whitespace, etc.)
+        scenes = [scene.strip() for scene in scenes]
+        
+        # Create structured scenes with rich content
+        structured_scenes = []
+        for i, scene_text in enumerate(scenes):
+            scene_num = i + 1
             
-            # For backwards compatibility, also create the old format
-            old_format_scenes = []
-            for scene in structured_scenes:
-                scene_num = scene.get("scene_number", 0)
-                scene_desc = scene.get("description", "")
-                old_format_scenes.append(f"Scene {scene_num}: {scene_desc}")
-                
-            # Update both formats
-            episode_str = str(episode_number)
-            structured_scenes_dict = {}
-            if hasattr(state, "structured_scenes"):
-                structured_scenes_dict = state.structured_scenes
-                
-            new_state = state.copy(update={
-                "episode_scripts": {
-                    **state.episode_scripts,
-                    episode_str: old_format_scenes  # Old format
-                },
-                "structured_scenes": {
-                    **structured_scenes_dict,
-                    episode_str: structured_scenes  # New format
-                }
-            })
-            
-        else:
-            # Handle old format or unstructured response
-            if isinstance(parsed_response, list):
-                scenes = parsed_response
+            # Try to extract a title if the scene has a format like "Title - Description"
+            title_match = re.match(r'^([^-:]+)[-:](.*)', scene_text)
+            if title_match:
+                scene_title = title_match.group(1).strip()
+                scene_desc = title_match.group(2).strip()
             else:
-                scenes = ["Scene 1: Opening scene of the episode.", "Scene 2: The story continues.", "Scene 3: Conclusion of the episode."]
-                
-            # Create structured format from the old format
-            structured_scenes = []
-            for i, scene in enumerate(scenes):
-                scene_num = i + 1
-                scene_title = f"Scene {scene_num}"
-                scene_desc = scene
-                
-                # Try to extract a better title if possible
-                scene_match = re.match(r'Scene\s+\d+:\s*(.*?)\.', scene)
-                if scene_match:
-                    scene_title = scene_match.group(1)[:30]  # Take first 30 chars as title
-                
-                structured_scenes.append({
-                    "scene_number": scene_num,
-                    "title": scene_title,
-                    "description": scene
-                })
-                
-            # Update both formats
-            episode_str = str(episode_number)
-            structured_scenes_dict = {}
-            if hasattr(state, "structured_scenes"):
-                structured_scenes_dict = state.structured_scenes
-                
-            new_state = state.copy(update={
-                "episode_scripts": {
-                    **state.episode_scripts,
-                    episode_str: scenes  # Old format
-                },
-                "structured_scenes": {
-                    **structured_scenes_dict,
-                    episode_str: structured_scenes  # New format
-                }
+                # Just use the first few words as title
+                words = scene_text.split()
+                scene_title = " ".join(words[:3]) + "..."
+                scene_desc = scene_text
+            
+            structured_scenes.append({
+                "scene_number": scene_num,
+                "title": scene_title,
+                "description": scene_desc
             })
+        
+        # Update both formats in the state
+        episode_str = str(episode_number)
+        structured_scenes_dict = {}
+        if hasattr(state, "structured_scenes"):
+            structured_scenes_dict = state.structured_scenes
+            
+        # Format the scenes for the old format (string list)
+        old_format_scenes = []
+        for scene in structured_scenes:
+            scene_num = scene.get("scene_number", 0)
+            scene_title = scene.get("title", "")
+            scene_desc = scene.get("description", "")
+            old_format_scenes.append(f"Scene {scene_num}: {scene_title} - {scene_desc}")
+            
+        new_state = state.copy(update={
+            "episode_scripts": {
+                **state.episode_scripts,
+                episode_str: old_format_scenes
+            },
+            "structured_scenes": {
+                **structured_scenes_dict,
+                episode_str: structured_scenes
+            }
+        })
         
         # Set the output for downstream processes
         new_state.last_agent_output = structured_scenes

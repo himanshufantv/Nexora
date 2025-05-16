@@ -21,135 +21,275 @@ def storyboard_agent(state: StoryState, user_message: str) -> StoryState:
     This agent:
     1. Extracts episode and scene numbers from the user message
     2. Generates detailed shot descriptions
-    3. Requests images for each shot from the AD agent
-    4. Updates the storyboard field with the shots and images
+    3. Requests images for each shot
+    
+    The result is stored in state.storyboard as a list of dictionaries
+    with episode_number, scene_number, shot_number, description, and image_url.
     """
-    print("🎬 Running Storyboard Agent...")
-    
-    # Extract episode and scene numbers from user message
-    episode_num, scene_num = extract_episode_scene_numbers(user_message)
-    
-    if episode_num is None or scene_num is None:
-        print(f"❌ Could not extract episode and scene numbers from: {user_message}")
-        return state
+    try:
+        # Determine if this is a storyboard generation request or scene creation
+        is_explicit_storyboard_request = "generate storyboard" in user_message.lower() or "create storyboard" in user_message.lower()
         
-    print(f"📊 Generating storyboard for Episode {episode_num}, Scene {scene_num}")
-    
-    # Find the scene in structured_scenes or episode_scripts
-    scene_description = find_scene_description(state, episode_num, scene_num)
-    
-    if not scene_description:
-        print(f"❌ Could not find scene description for Episode {episode_num}, Scene {scene_num}")
-        return state
+        # Extract episode and scene numbers from the user message
+        episode_num, scene_num = extract_episode_scene_numbers(user_message)
+        if episode_num is None or scene_num is None:
+            return state
+            
+        print(f"Storyboard agent creating storyboard for Episode {episode_num}, Scene {scene_num}")
+        print(f"Is explicit storyboard request: {is_explicit_storyboard_request}")
         
-    print(f"📜 Found scene description: {scene_description[:100]}...")
-    
-    # Initialize the scene_seeds storage if needed
-    if not hasattr(state, "scene_seeds"):
-        state.scene_seeds = {}
-    
-    # Check if there's a stored seed for this scene
-    scene_key = f"ep{episode_num}_scene{scene_num}"
-    scene_seed = None
-    
-    if scene_key in state.scene_seeds:
-        scene_seed = state.scene_seeds[scene_key]
-        print(f"Found existing seed {scene_seed} for {scene_key} - will use for consistent visuals")
-    
-    # Generate detailed shot descriptions
-    shot_descriptions = generate_shot_descriptions(state, scene_description, episode_num, scene_num)
-    
-    if not shot_descriptions:
-        print(f"❌ Failed to generate shot descriptions")
-        return state
+        # Find the scene description to generate shots from
+        scene_description = find_scene_description(state, episode_num, scene_num)
+        if not scene_description:
+            print(f"No scene description found for Episode {episode_num}, Scene {scene_num}")
+            return state
+            
+        print(f"Found scene description: {scene_description[:100]}...")
         
-    print(f"✅ Generated {len(shot_descriptions)} shot descriptions")
-    
-    # Generate images for each shot using AD agent
-    storyboard_items = []
-    
-    for i, shot in enumerate(shot_descriptions):
-        print(f"🖼️ Generating image for Shot {i+1}")
+        # Generate detailed shot-by-shot breakdown
+        prompt = f"""
+You are a professional storyboard artist for a TV series.
+
+Create a detailed shot-by-shot breakdown for the following scene:
+
+Episode {episode_num}, Scene {scene_num}
+{scene_description}
+
+Return a JSON array with 5-8 shots. Each shot should have:
+1. A shot number
+2. A detailed visual description that includes camera angle, movement, composition, and action
+3. Any essential dialogue or sound elements
+
+Response should be ONLY the JSON array with this structure:
+[
+  {{
+    "shot_number": 1,
+    "description": "Detailed visual description...",
+    "dialogue": "Any important dialogue or NONE if no dialogue"
+  }},
+  ...
+]
+"""
         
-        # Call AD agent to generate image for this shot
-        # Note: The AD agent handles the actual image generation via Replicate
-        shot_state = state.copy()
-        shot_state.scene_scripts = {
-            f"ep{episode_num}_scene{scene_num}": [{"shot": shot, "dialogue": ""}]
-        }
-        
-        # Use the AD agent to generate the image with consistent seed
+        shot_descriptions = []
         try:
-            if scene_seed:
-                print(f"Passing seed {scene_seed} to AD agent for consistent visuals")
-                updated_state = ad_agent(shot_state, episode_number=episode_num, scene_number=scene_num, seed=scene_seed)
-            else:
-                updated_state = ad_agent(shot_state, episode_number=episode_num, scene_number=scene_num)
-                
-                # If this is the first shot and a seed was generated, save it for consistency
-                if i == 0 and hasattr(updated_state, "last_generated_seed") and updated_state.last_generated_seed:
-                    scene_seed = updated_state.last_generated_seed
-                    print(f"✅ Saved seed {scene_seed} for scene {scene_key}")
-                    state.scene_seeds[scene_key] = scene_seed
+            print("Calling GPT-4 to generate shot descriptions...")
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7
+            )
             
-            # Extract the generated image URL
-            scene_key = f"ep{episode_num}_scene{scene_num}_shot1"  # AD agent uses this format
-            image_url = ""
+            description_text = response.choices[0].message.content
             
-            if hasattr(updated_state, "ad_images") and scene_key in updated_state.ad_images:
-                image_url = updated_state.ad_images[scene_key]
-                print(f"✅ Generated image: {image_url[:50]}...")
-            else:
-                print("❌ Failed to generate image for shot")
+            # Extract JSON if in code block
+            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', description_text)
+            if json_match:
+                description_text = json_match.group(1).strip()
                 
-            # Create storyboard item
+            # Parse shot descriptions
+            import json
+            try:
+                shot_descriptions = json.loads(description_text)
+                print(f"Generated {len(shot_descriptions)} shot descriptions")
+            except json.JSONDecodeError as e:
+                print(f"Error parsing shot descriptions: {e}")
+                # Fall back to regex extraction if JSON parse fails
+                shot_descriptions = []
+                shot_matches = re.findall(r'"shot_number":\s*(\d+)[^{]*"description":\s*"([^"]*)"', description_text)
+                for shot_num, desc in shot_matches:
+                    shot_descriptions.append({
+                        "shot_number": int(shot_num),
+                        "description": desc,
+                        "dialogue": "NONE"
+                    })
+                print(f"Extracted {len(shot_descriptions)} shot descriptions using regex")
+                
+        except Exception as e:
+            print(f"Error generating shot descriptions: {e}")
+            return state
+            
+        # Prepare to store the results
+        storyboard_items = []
+        formatted_shots = []
+        
+        # Initialize the scene_seeds storage if needed
+        if not hasattr(state, "scene_seeds"):
+            state.scene_seeds = {}
+        
+        # Check if there's a stored seed for this scene
+        scene_key = f"ep{episode_num}_scene{scene_num}"
+        scene_seed = None
+        
+        if scene_key in state.scene_seeds:
+            scene_seed = state.scene_seeds[scene_key]
+            print(f"Found existing seed {scene_seed} for {scene_key} - will use for consistent visuals")
+        
+        # For each shot, generate an image if this is an explicit storyboard request
+        for i, shot in enumerate(shot_descriptions):
+            shot_num = shot.get("shot_number", i + 1)
+            description = shot.get("description", "")
+            dialogue = shot.get("dialogue", "")
+            
+            if dialogue == "NONE":
+                dialogue = ""
+                
+            formatted_shot = {
+                "shot": description,
+                "dialogue": dialogue
+            }
+            formatted_shots.append(formatted_shot)
+            
+            # Create storyboard item with initial data
             storyboard_item = {
                 "episode_number": episode_num,
                 "scene_number": scene_num,
-                "shot_number": i+1,
-                "description": shot,
-                "image_url": image_url
+                "shot_number": shot_num,
+                "description": description,
+                "image_url": ""  # Will be populated later if needed
             }
             
-            storyboard_items.append(storyboard_item)
+            # Add title field with story title-episode-scene format
+            story_title = state.title if hasattr(state, "title") and state.title else "Story"
+            storyboard_item["title"] = f"{story_title}-Episode {episode_num}-Scene {scene_num}"
             
-        except Exception as e:
-            print(f"❌ Error generating image for shot: {e}")
-    
-    # Update scene_scripts with the detailed shots
-    formatted_shots = []
-    
-    for i, shot in enumerate(shot_descriptions):
-        formatted_shot = {
-            "shot": shot,
-            "dialogue": ""
-        }
-        formatted_shots.append(formatted_shot)
-    
-    # Create the script output in markdown format
-    script_output = f"#### Scene {scene_num}: {get_scene_title(state, episode_num, scene_num)}\n\n"
-    
-    for i, shot in enumerate(shot_descriptions):
-        script_output += f"**Shot {i+1}**: {shot}\n\n"
-    
-    # Update the state
-    if not hasattr(state, "storyboard") or state.storyboard is None:
-        state.storyboard = []
+            # Only generate images for explicit storyboard requests
+            if is_explicit_storyboard_request:
+                try:
+                    print(f"Generating image for Shot {shot_num} using AD agent with character LoRAs")
+                    
+                    # Create a temporary state with just this shot for the AD agent
+                    shot_state = state.copy()
+                    shot_state.scene_scripts = {
+                        scene_key: [{"shot": description, "dialogue": dialogue}]
+                    }
+                    
+                    # Use the AD agent to generate the image with consistent seed
+                    if scene_seed:
+                        print(f"Passing seed {scene_seed} to AD agent for consistent visuals")
+                        updated_shot_state = ad_agent(shot_state, episode_number=episode_num, scene_number=scene_num, seed=scene_seed)
+                    else:
+                        # For first shot, generate without seed to get a new one
+                        updated_shot_state = ad_agent(shot_state, episode_number=episode_num, scene_number=scene_num)
+                        
+                        # If this is the first shot and a seed was generated, save it for consistency
+                        if hasattr(updated_shot_state, "last_generated_seed") and updated_shot_state.last_generated_seed:
+                            scene_seed = updated_shot_state.last_generated_seed
+                            state.scene_seeds[scene_key] = scene_seed
+                            print(f"Saved new seed {scene_seed} for scene {scene_key} - will use for all shots in this scene")
+                    
+                    # Ensure the last generated seed is saved back to the main state
+                    if hasattr(updated_shot_state, "last_generated_seed") and updated_shot_state.last_generated_seed:
+                        state.last_generated_seed = updated_shot_state.last_generated_seed
+                    
+                    # Extract the generated image URL
+                    ad_scene_key = f"ep{episode_num}_scene{scene_num}_shot1"  # AD agent uses this format
+                    image_url = ""
+                    
+                    if hasattr(updated_shot_state, "ad_images") and ad_scene_key in updated_shot_state.ad_images:
+                        image_url = updated_shot_state.ad_images[ad_scene_key]
+                        print(f"Generated image: {image_url[:50]}...")
+                    else:
+                        print(f"No image found for shot {shot_num}, trying alternative key format")
+                        # Try alternative key format
+                        alt_scene_key = f"episode_{episode_num}_scene_{scene_num}"
+                        if hasattr(updated_shot_state, "ad_images") and alt_scene_key in updated_shot_state.ad_images:
+                            image_url = updated_shot_state.ad_images[alt_scene_key]
+                            print(f"Found image with alternative key: {image_url[:50]}...")
+                    
+                    # Update the storyboard item with the image URL
+                    storyboard_item["image_url"] = image_url
+                    
+                    # Also capture character information for consistent visuals
+                    if hasattr(updated_shot_state, "ad_character_info"):
+                        # Grab any character info associated with this shot's image
+                        for info_key, char_info in updated_shot_state.ad_character_info.items():
+                            if info_key.startswith(f"ep{episode_num}_scene{scene_num}") or info_key.startswith(f"episode_{episode_num}_scene_{scene_num}"):
+                                storyboard_item["character_info"] = char_info
+                                print(f"Captured character info: {char_info}")
+                                break
+                    
+                except Exception as e:
+                    print(f"Error generating image for shot {shot_num}: {e}")
+            
+            # Add the storyboard item to our list
+            storyboard_items.append(storyboard_item)
         
-    state.storyboard.extend(storyboard_items)
-    
-    state.scene_scripts = {
-        **state.scene_scripts,
-        scene_key: formatted_shots
-    }
-    
-    state.last_agent_output = script_output
-    
-    log_agent_output("Storyboard", state)
-    return state
+        # Format output for UI
+        script_output = f"# Episode {episode_num}, Scene {scene_num} Storyboard\n\n"
+        
+        for i, shot in enumerate(shot_descriptions):
+            script_output += f"**Shot {i+1}**: {shot['description']}\n\n"
+        
+        # Update the state
+        if not hasattr(state, "storyboard") or state.storyboard is None:
+            state.storyboard = []
+        
+        if is_explicit_storyboard_request:
+            # Add storyboard items to state only for explicit storyboard requests
+            state.storyboard.extend(storyboard_items)
+            
+            # Copy AD images and prompts from any updated shot states into the main state
+            if not hasattr(state, "ad_images"):
+                state.ad_images = {}
+            
+            # Look for image URLs from both AD agent formats and store them
+            for item in storyboard_items:
+                if item["image_url"]:
+                    scene_key = f"ep{item['episode_number']}_scene{item['scene_number']}_shot{item['shot_number']}"
+                    alt_key = f"episode_{item['episode_number']}_scene_{item['scene_number']}"
+                    
+                    # Store the image URL under multiple keys to ensure it's found later
+                    state.ad_images[scene_key] = item["image_url"]
+                    state.ad_images[alt_key] = item["image_url"]
+                    
+                    # Also store character info if available
+                    if "character_info" in item and item["character_info"]:
+                        if not hasattr(state, "ad_character_info"):
+                            state.ad_character_info = {}
+                        state.ad_character_info[scene_key] = item["character_info"]
+                        state.ad_character_info[alt_key] = item["character_info"]
+                        print(f"Saved character info for {scene_key} and {alt_key}")
+                    
+                    print(f"Copied storyboard image to state.ad_images: {scene_key} and {alt_key}")
+        else:
+            # For scene creation, we don't update the storyboard array, leaving it empty
+            print("📝 Not updating storyboard array as this is just scene creation")
+        
+        state.scene_scripts = {
+            **state.scene_scripts,
+            scene_key: formatted_shots
+        }
+        
+        state.last_agent_output = script_output
+        
+        log_agent_output("Storyboard", state)
+        return state
+        
+    except Exception as e:
+        print(f"Error in storyboard_agent: {e}")
+        log_error("Storyboard", str(e))
+        return state
 
 def extract_episode_scene_numbers(user_message: str):
     """Extract episode and scene numbers from the user message."""
+    # Handle generic storyboard generation requests
+    if "generate storyboard" in user_message.lower() or "create storyboard" in user_message.lower():
+        # Check if the message contains specific episode and scene info
+        episode_match = re.search(r'episode\s+(\d+)', user_message, re.IGNORECASE)
+        scene_match = re.search(r'scene\s+(\d+)', user_message, re.IGNORECASE)
+        
+        if episode_match and scene_match:
+            # User specified both episode and scene
+            episode_num = int(episode_match.group(1))
+            scene_num = int(scene_match.group(1))
+            return episode_num, scene_num
+        else:
+            # If no episode/scene specified, default to episode 1, scene 1
+            print("No specific episode/scene found in storyboard request. Using defaults: Episode 1, Scene 1")
+            return 1, 1
+    
+    # Normal extraction for specific scene creation
     # Try to find numbers using regex
     episode_match = re.search(r'episode\s+(\d+)', user_message, re.IGNORECASE)
     scene_match = re.search(r'scene\s+(\d+)', user_message, re.IGNORECASE)
@@ -193,95 +333,5 @@ def find_scene_description(state: StoryState, episode_num: int, scene_num: int) 
             if 0 <= scene_num - 1 < len(scenes):
                 return scenes[scene_num - 1]
     
-    return ""
-
-def get_scene_title(state: StoryState, episode_num: int, scene_num: int) -> str:
-    """Get a title for the scene, either from structured_scenes or a default."""
-    episode_str = str(episode_num)
-    
-    # Check in structured_scenes
-    if hasattr(state, "structured_scenes") and state.structured_scenes:
-        if episode_str in state.structured_scenes:
-            scenes = state.structured_scenes[episode_str]
-            for scene in scenes:
-                if scene.get("scene_number") == scene_num:
-                    return scene.get("title", f"Scene {scene_num}")
-    
-    return f"Scene {scene_num}"
-
-def generate_shot_descriptions(state: StoryState, scene_description: str, episode_num: int, scene_num: int) -> list:
-    """Generate detailed shot descriptions for a scene."""
-    # Get character information if available
-    character_info = ""
-    if hasattr(state, "character_profiles") and state.character_profiles:
-        characters = []
-        for profile in state.character_profiles:
-            name = profile.get("name", "")
-            desc = profile.get("description", "")[:100]  # Truncate long descriptions
-            if name:
-                characters.append(f"{name}: {desc}")
-        
-        if characters:
-            character_info = "Characters in scene:\n" + "\n".join(characters)
-    
-    # Generate detailed shots
-    prompt = f"""
-You are a professional film storyboard artist. Create 6-8 detailed shot descriptions for this scene.
-
-Scene Description:
-{scene_description}
-
-{character_info}
-
-For each shot, provide a detailed visual description that includes:
-- Camera angle (close-up, medium shot, wide shot, etc.)
-- Character positions and actions
-- Setting details
-- Lighting and mood
-
-Do NOT include dialogue in the shot descriptions, only visual elements.
-Each shot should be a paragraph of 2-4 sentences.
-
-Respond with ONLY the shot descriptions, numbered as "Shot 1", "Shot 2", etc.
-"""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
-        )
-        
-        shot_text = response.choices[0].message.content.strip()
-        
-        # Parse shots from the response
-        shots = []
-        current_shot = ""
-        
-        for line in shot_text.split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Check if this is a new shot
-            shot_match = re.match(r'^Shot\s+\d+:', line, re.IGNORECASE)
-            if shot_match:
-                # Save previous shot if it exists
-                if current_shot:
-                    shots.append(current_shot.strip())
-                
-                # Start new shot, removing the "Shot X:" prefix
-                shot_prefix_end = line.find(':') + 1
-                current_shot = line[shot_prefix_end:].strip()
-            else:
-                # Continue current shot
-                current_shot += " " + line
-        
-        # Add the last shot
-        if current_shot:
-            shots.append(current_shot.strip())
-        
-        return shots
-    except Exception as e:
-        print(f"❌ Error generating shot descriptions: {e}")
-        return [] 
+    # If nothing is found, return a generic description
+    return f"Scene {scene_num} of Episode {episode_num}" 
