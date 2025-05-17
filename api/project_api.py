@@ -7,6 +7,7 @@ from utils.types import StoryState
 from engine.runner import run_agent
 from openai import OpenAI
 from typing import Optional, Dict, Any, List
+import requests  # Add this import for making HTTP requests
 
 import os
 import uuid
@@ -56,6 +57,14 @@ class EditMessageRequest(BaseModel):
     session_id: str
     message_id: str
     new_message: str
+
+class VideoGenerationRequest(BaseModel):
+    session_id: str
+    episode_number: Optional[int] = None
+    scene_number: Optional[int] = None
+    shot_number: Optional[int] = None  # Added shot_number parameter
+    # Optional parameters for future customization
+    options: Optional[Dict[str, Any]] = {}
 
 # Helper function to determine response type
 def determine_response_type(text: str) -> str:
@@ -2326,3 +2335,206 @@ async def generate_script_overview(response_text: str, prompt: str) -> str:
         import traceback
         print(traceback.format_exc())
         return "Your request has been processed successfully."
+
+@router.post("/generate_videos")
+async def generate_videos(request: VideoGenerationRequest):
+    """
+    Generate videos from storyboard images.
+    Optionally filter by episode_number, scene_number, and shot_number.
+    """
+    try:
+        print(f"==== /generate_videos API CALLED ====")
+        print(f"Session ID: {request.session_id}")
+        print(f"Episode: {request.episode_number if request.episode_number else 'All'}")
+        print(f"Scene: {request.scene_number if request.scene_number else 'All'}")
+        print(f"Shot: {request.shot_number if request.shot_number else 'All'}")
+        
+        # Get project data from database
+        project = story_projects.find_one({"session_id": request.session_id})
+        if not project or not project.get("story_data"):
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Get storyboard items
+        story_data = project.get("story_data", {})
+        storyboard = story_data.get("storyboard", [])
+        
+        if not storyboard:
+            return {
+                "success": False,
+                "message": "No storyboard found for this project"
+            }
+        
+        # Filter storyboard items if episode or scene specified
+        filtered_storyboard = storyboard
+        if request.episode_number is not None:
+            filtered_storyboard = [
+                item for item in filtered_storyboard 
+                if item.get("episode_number") == request.episode_number
+            ]
+            
+        if request.scene_number is not None:
+            filtered_storyboard = [
+                item for item in filtered_storyboard 
+                if item.get("scene_number") == request.scene_number
+            ]
+        
+        # Filter by shot number if specified
+        if request.shot_number is not None:
+            filtered_storyboard = [
+                item for item in filtered_storyboard 
+                if item.get("shot_number") == request.shot_number
+            ]
+        
+        if not filtered_storyboard:
+            return {
+                "success": False,
+                "message": f"No storyboard items found matching the criteria"
+            }
+        
+        print(f"Found {len(filtered_storyboard)} storyboard items to process")
+        
+        # Validate that all items have image URLs
+        items_without_images = [
+            item for item in filtered_storyboard
+            if not item.get("image_url")
+        ]
+        
+        if items_without_images:
+            print(f"WARNING: {len(items_without_images)} storyboard items are missing image URLs")
+        
+        valid_items = [
+            item for item in filtered_storyboard
+            if item.get("image_url")
+        ]
+        
+        if not valid_items:
+            return {
+                "success": False,
+                "message": "None of the storyboard items have image URLs"
+            }
+        
+        # Create state object with filtered storyboard data
+        state = StoryState()
+        state.storyboard = valid_items
+        
+        # Run the video design agent to generate videos
+        print(f"Calling video_design_agent to generate videos for {len(valid_items)} storyboard items")
+        
+        # Import the video_design_agent here to avoid circular imports
+        from agents.video_design import video_design_agent
+        updated_state = video_design_agent(state)
+        
+        # Get the generated video clips
+        video_clips = updated_state.video_clips if hasattr(updated_state, "video_clips") else []
+        
+        if not video_clips:
+            return {
+                "success": False,
+                "message": "No videos were generated"
+            }
+        
+        # Upload videos to the external API and update clip information
+        for clip in video_clips:
+            if "path" in clip:
+                local_path = clip["path"]
+                print(f"Uploading video from {local_path} to external API")
+                
+                try:
+                    # Upload the video file to the external API using curl format
+                    print(f"Using exact curl-compatible format to upload {local_path}")
+                    with open(local_path, 'rb') as video_file:
+                        files = {
+                            'file': (os.path.basename(local_path), video_file, 'video/mp4')
+                        }
+                        response = requests.post(
+                            'https://upload.artistfirst.in/upload',
+                            files=files,
+                            timeout=60  # Increase timeout to 60 seconds
+                        )
+                    
+                    # Check if upload was successful
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        print(f"Upload response: {response_data}")
+                        
+                        # Handle the actual API response format with nested data array
+                        if 'data' in response_data and isinstance(response_data['data'], list) and len(response_data['data']) > 0:
+                            if 'url' in response_data['data'][0]:
+                                # Save the remote URL to the clip data
+                                clip["remote_url"] = response_data['data'][0]['url']
+                                print(f"Successfully uploaded to {response_data['data'][0]['url']}")
+                            else:
+                                print(f"URL field not found in data array: {response_data}")
+                        # Fallback to legacy format if available
+                        elif 'url' in response_data:
+                            # Save the remote URL to the clip data
+                            clip["remote_url"] = response_data['url']
+                            print(f"Successfully uploaded to {response_data['url']}")
+                        else:
+                            print(f"Upload succeeded but required fields not found in response: {response_data}")
+                    else:
+                        print(f"Upload failed with status code {response.status_code}: {response.text}")
+                except Exception as upload_err:
+                    print(f"Error uploading video to external API: {upload_err}")
+            
+            # Ensure local paths are converted to relative URLs for frontend
+            if "path" in clip and not "url" in clip:
+                filename = os.path.basename(clip["path"])
+                clip["url"] = f"/videos/{filename}"
+        
+        # Initialize or update the video_data structure in story_data
+        if "video_data" not in story_data:
+            story_data["video_data"] = {}
+            
+        # Organize videos by episode, scene, and shot
+        for clip in video_clips:
+            episode_num = clip.get("episode_number")
+            scene_num = clip.get("scene_number")
+            shot_num = clip.get("shot_number")
+            
+            # Create a unique key for this video
+            video_key = f"ep{episode_num}_scene{scene_num}_shot{shot_num}"
+            
+            # Store video data with all metadata
+            story_data["video_data"][video_key] = {
+                "episode_number": episode_num,
+                "scene_number": scene_num,
+                "shot_number": shot_num,
+                "local_url": clip.get("url"),
+                "remote_url": clip.get("remote_url", ""),
+                "description": clip.get("description", ""),
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            print(f"Added video data for {video_key} to story_data.video_data")
+        
+        # Update the video_clips array (keeping the original functionality)
+        if "video_clips" not in story_data:
+            story_data["video_clips"] = []
+            
+        # Add new clips to the existing array
+        story_data["video_clips"].extend(video_clips)
+        
+        # Update the database with all video information
+        story_projects.update_one(
+            {"session_id": request.session_id},
+            {"$set": {
+                "story_data.video_clips": story_data["video_clips"],
+                "story_data.video_data": story_data["video_data"]
+            }}
+        )
+        
+        print(f"Successfully generated and processed {len(video_clips)} video clips")
+        
+        return {
+            "success": True,
+            "message": f"Generated {len(video_clips)} video clips",
+            "video_clips": video_clips,
+            "total_clips": len(story_data["video_clips"])
+        }
+        
+    except Exception as e:
+        print(f"Error generating videos: {e}")
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error generating videos: {str(e)}")

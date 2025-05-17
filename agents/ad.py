@@ -77,67 +77,74 @@ def detect_characters_in_text(text, character_names):
 
 @log_entry_exit
 def select_best_lora(character_profiles, detected_characters):
-    """
-    Select the best LoRA based on characters in the scene.
-    
-    Args:
-        character_profiles (list): List of character profile objects
-        detected_characters (list): List of character names detected in the scene
-    
-    Returns:
-        tuple: (lora_type, lora_value, character_pair) where:
-            - lora_type is "combined" or "individual"
-            - lora_value is the LoRA file to use
-            - character_pair is a list of the character names (if combined)
-    """
+    """Select the best LoRA to use based on detected characters."""
+    # If no characters detected, use default LoRA
     if not detected_characters:
-        log_flow("No characters detected in scene, using default LoRA", level="warning")
-        if character_profiles:
-            # Default to first character's LoRA
-            return "individual", character_profiles[0].get("hf_lora", ""), [character_profiles[0].get("name", "")]
-        return "none", "", []
+        print("WARNING: No characters detected in scene, using default LoRA")
+        return "default", None, []
     
-    # If only one character detected, use their individual LoRA
+    # If only one character detected, use that character's individual LoRA
     if len(detected_characters) == 1:
         char_name = detected_characters[0]
-        profile = next((p for p in character_profiles if p.get("name") == char_name), None)
-        if profile and profile.get("hf_lora"):
-            log_flow(f"Using individual LoRA for character: {char_name}")
-            return "individual", profile.get("hf_lora"), [char_name]
+        for profile in character_profiles:
+            if profile["name"] == char_name:
+                print(f"Using individual LoRA for character: {char_name}")
+                return "individual", profile.get("hf_lora"), [char_name]
     
-    # If two or more characters detected, try to find a compatible pair with combined_lora
-    if len(detected_characters) >= 2:
-        log_flow(f"Multiple characters detected ({len(detected_characters)}), looking for combined LoRA")
-        # Check each possible pair
-        for i, char1_name in enumerate(detected_characters):
-            for char2_name in detected_characters[i+1:]:
-                char1 = next((p for p in character_profiles if p.get("name") == char1_name), None)
-                char2 = next((p for p in character_profiles if p.get("name") == char2_name), None)
-                
-                # Check if either character has a combined_lora
-                if char1 and char2:
-                    if char1.get("combined_lora"):
-                        log_flow(f"Using combined LoRA for pair: {char1_name} and {char2_name}")
-                        return "combined", char1.get("combined_lora"), [char1_name, char2_name]
-                    if char2.get("combined_lora"):
-                        log_flow(f"Using combined LoRA for pair: {char1_name} and {char2_name}")
-                        return "combined", char2.get("combined_lora"), [char1_name, char2_name]
+    # If two characters, check if we have a combined LoRA
+    if len(detected_characters) == 2:
+        for profile in character_profiles:
+            if profile["name"] == detected_characters[0]:
+                profile_a = profile
+            if profile["name"] == detected_characters[1]:
+                profile_b = profile
+        
+        if "profile_a" in locals() and "profile_b" in locals():
+            if "combined_lora" in profile_a:
+                print(f"Using combined LoRA for: {detected_characters[0]} and {detected_characters[1]}")
+                return "combined", profile_a.get("combined_lora"), detected_characters
     
-    # Fallback: use the first detected character's individual LoRA
-    char_name = detected_characters[0]
-    profile = next((p for p in character_profiles if p.get("name") == char_name), None)
-    if profile and profile.get("hf_lora"):
-        log_flow(f"Fallback: Using individual LoRA for first detected character: {char_name}")
-        return "individual", profile.get("hf_lora"), [char_name]
+    # Fallback - use LoRA of first character
+    for char in detected_characters:
+        for profile in character_profiles:
+            if profile["name"] == char:
+                print(f"Using first character's LoRA as fallback: {char}")
+                return "individual", profile.get("hf_lora"), [char]
     
-    # Last resort: use any available LoRA from character profiles
-    for profile in character_profiles:
-        if profile.get("hf_lora"):
-            log_flow("Last resort: Using individual LoRA from available profiles", level="warning")
-            return "individual", profile.get("hf_lora"), [profile.get("name", "Unknown")]
-    
-    log_flow("No suitable LoRA found", level="warning")
-    return "none", "", []
+    # Final fallback
+    print("WARNING: No suitable LoRA found, using default")
+    return "default", None, []
+
+@log_entry_exit
+def generate_image_prompt(shot_content, detected_characters):
+    """Generate an image prompt for the given shot content."""
+    prompt_to_gpt = f"""
+You are an expert cinematic visual storyteller.
+
+Given this shot description, create a 9:16 image generation prompt in Flux style.
+
+Constraints:
+- Ultra-realistic texture
+- Cinematic lighting with volumetric shadows
+- Soft focus background
+- Do NOT mention camera brands
+
+Shot Description:
+"{shot_content}"
+
+Characters in shot: {', '.join(detected_characters) if detected_characters else 'None specified'}
+
+Respond ONLY with the image prompt.
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt_to_gpt}],
+        temperature=0.7
+    )
+
+    image_prompt = response.choices[0].message.content.strip()
+    return image_prompt
 
 @log_entry_exit
 def ensure_character_profiles(state):
@@ -354,159 +361,98 @@ def ad_agent(state: StoryState, episode_number=None, scene_number=None, seed=Non
     character_names = [profile.get("name", "") for profile in finalized_characters]
     print(f"👥 Looking for these characters in scenes: {', '.join(character_names)}")
 
-    # Handle scene scripts if they exist
-    if state.scene_scripts:
-        print(f"📜 Found {len(state.scene_scripts)} scene scripts to process")
+    # Begin processing scene scripts
+    print(f"📜 Found {len(state.scene_scripts)} scene scripts to process")
+    
+    # If specific episode/scene was requested, only process that one
+    target_key = None
+    if episode_number and scene_number:
+        target_key = f"ep{episode_number}_scene{scene_number}"
+        print(f"🎯 Found target scene {target_key}, processing only this scene")
+    
+    # Process each scene script
+    for scene_key, shots in state.scene_scripts.items():
+        # Skip scenes that don't match our target if specified
+        if target_key and not scene_key.startswith(target_key):
+            continue
         
-        # If targeting a specific scene, only process that one
-        if is_specific_request:
-            target_scene_key = f"ep{episode_number}_scene{scene_number}"
-            if target_scene_key in state.scene_scripts:
-                scenes_to_process = {target_scene_key: state.scene_scripts[target_scene_key]}
-                print(f"🎯 Found target scene {target_scene_key}, processing only this scene")
-            else:
-                print(f"⚠️ Target scene {target_scene_key} not found in state.scene_scripts")
-                scenes_to_process = {}
+        # Extract shot number from scene_key if available (format: ep{ep}_scene{scene}_shot{shot})
+        shot_number = 1  # Default
+        shot_match = re.search(r'_shot(\d+)$', scene_key)
+        if shot_match:
+            shot_number = int(shot_match.group(1))
+            # Extract the base scene key without the shot number
+            base_scene_key = scene_key.rsplit('_shot', 1)[0]
         else:
-            scenes_to_process = state.scene_scripts
-
-        for scene_key, shots in scenes_to_process.items():
-            if not shots:
-                continue
-
-            # Initialize first background seed for the scene
-            scene_seed = seed if is_specific_request and scene_key == target_scene_key else None
-
-            for idx, shot_info in enumerate(shots):
-                shot_text = shot_info.get("shot", "")
-                dialogue_text = shot_info.get("dialogue", "")
-
-                if not shot_text:
-                    continue
-
-                # Detect characters in this shot
-                shot_full_text = f"{shot_text} {dialogue_text}".strip()
-                detected_chars = detect_characters_in_text(shot_full_text, character_names)
-                print(f"🧠 Scene {scene_key}, Shot {idx+1}: Detected characters: {detected_chars}")
+            base_scene_key = scene_key
+            
+        # Process each shot in the scene
+        for i, shot_data in enumerate(shots):
+            # Get shot content
+            shot_content = ""
+            if isinstance(shot_data, dict):
+                shot_content = shot_data.get("shot", "")
+                if "dialogue" in shot_data and shot_data["dialogue"]:
+                    shot_content += " " + shot_data["dialogue"]
+            else:
+                shot_content = str(shot_data)
                 
-                # Select best LoRA based on detected characters
-                lora_type, lora_to_use, char_pair = select_best_lora(finalized_characters, detected_chars) 
-                
-                # Create prompt for GPT to create visual prompt
-                prompt_to_gpt = f"""
-You are an expert cinematic visual storyteller.
-
-Given this shot description, create a 9:16 image generation prompt in Flux style.
-
-Constraints:
-- Ultra-realistic texture
-- Cinematic lighting with volumetric shadows
-- Soft focus background
-- Do NOT mention camera brands
-
-Shot Description:
-"{shot_text}"
-
-Dialogue (if any):
-"{dialogue_text}"
-
-Characters in shot: {', '.join(detected_chars) if detected_chars else 'None specified'}
-
-Respond ONLY with the image prompt.
-"""
-
-                response = client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[{"role": "user", "content": prompt_to_gpt}],
-                    temperature=0.7
-                )
-
-                image_prompt = response.choices[0].message.content.strip()
-
-                # Build unique key
-                unique_key = f"{scene_key}_shot{idx+1}"
-                ad_prompts[unique_key] = image_prompt
-                
-                # Store character information for this shot
-                ad_character_info[unique_key] = {
-                    "detected_characters": detected_chars,
-                    "lora_type": lora_type,
-                    "lora_value": lora_to_use,
-                    "character_pair": char_pair
-                }
-
-                print(f"🖼️ Generating image for {unique_key}" + 
-                      (f" using {lora_type} LoRA: {lora_to_use}" if lora_to_use else " without LoRA"))
-
-                # Set seed: reuse same seed within the scene
-                if scene_seed is None:
-                    print(f"========== CHARACTER SCENE IMAGE GENERATION ==========")
-                    print(f"Shot key: {unique_key}")
-                    print(f"Image prompt: {image_prompt}")
-                    print(f"Characters in shot: {detected_chars}")
-                    print(f"LoRA type: {lora_type}")
-                    print(f"LoRA value: {lora_to_use}")
-                    print(f"Character pair: {char_pair}")
-                    
-                    # Check if we already have a seed for this scene in state.scene_seeds
-                    # Extract episode and scene numbers from scene_key
-                    scene_key_parts = scene_key.split('_')
-                    if len(scene_key_parts) >= 2:
-                        try:
-                            ep_num = int(scene_key_parts[0][2:])  # Extract number from "ep1"
-                            scene_num = int(scene_key_parts[1][5:])  # Extract number from "scene1"
-                            state_scene_key = f"episode_{ep_num}_scene_{scene_num}"
-                            
-                            if state_scene_key in state.scene_seeds:
-                                # Use the seed from state
-                                stored_seed = state.scene_seeds[state_scene_key]
-                                print(f"Found stored seed {stored_seed} for {state_scene_key}")
-                                scene_seed = stored_seed
-                                image_url, _ = generate_flux_image(image_prompt, hf_lora=lora_to_use, seed=scene_seed)
-                                last_generated_seed = scene_seed
-                            else:
-                                # Generate a new seed
-                                print(f"Generating first image in scene (seed will be auto-generated)")
-                                image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
-                                if used_seed is not None:
-                                    scene_seed = used_seed
-                                    last_generated_seed = used_seed
-                                    # Save the seed in state.scene_seeds
-                                    state.scene_seeds[state_scene_key] = scene_seed
-                                    print(f"Generated and stored seed {scene_seed} for {state_scene_key}")
-                                    print(f"Generated seed {scene_seed} will be used for subsequent shots in this scene")
-                        except (ValueError, IndexError):
-                            # If parsing fails, just generate a new image
-                            print(f"Failed to parse scene key '{scene_key}', generating image with new seed")
-                            image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
-                            if used_seed is not None:
-                                scene_seed = used_seed
-                                last_generated_seed = used_seed
-                    else:
-                        # Invalid scene key format, just generate a new image
-                        print(f"Invalid scene key format '{scene_key}', generating image with new seed")
-                        image_url, used_seed = generate_flux_image(image_prompt, hf_lora=lora_to_use)
-                        if used_seed is not None:
-                            scene_seed = used_seed
-                            last_generated_seed = used_seed
-                else:
-                    print(f"========== CHARACTER SCENE IMAGE GENERATION ==========")
-                    print(f"Shot key: {unique_key}")
-                    print(f"Image prompt: {image_prompt}")
-                    print(f"Characters in shot: {detected_chars}")
-                    print(f"LoRA type: {lora_type}")
-                    print(f"LoRA value: {lora_to_use}")
-                    print(f"Character pair: {char_pair}")
-                    print(f"Reusing scene seed: {scene_seed}")
-                    image_url, _ = generate_flux_image(image_prompt, hf_lora=lora_to_use, seed=scene_seed)
-                    last_generated_seed = scene_seed  # Store for returning to caller
-
-                if not image_url:
-                    print(f"❌ Failed to generate image for {unique_key}.")
-                else:
-                    print(f"✅ {unique_key} → {image_url[:50]}...")
-
-                ad_images[unique_key] = image_url
+            # Detect characters in this shot
+            detected_characters = detect_characters_in_text(shot_content, character_names)
+            print(f"🧠 Scene {base_scene_key}, Shot {shot_number}: Detected characters: {detected_characters}")
+            
+            # Select appropriate LoRA based on characters in shot
+            lora_type, lora_value, character_pair = select_best_lora(finalized_characters, detected_characters)
+            
+            # Generate image prompt
+            prompt = generate_image_prompt(shot_content, detected_characters)
+            print(f"🖼️ Generating image for {scene_key} using {lora_type} LoRA: {lora_value}")
+            
+            # Build unique key - keep the original scene_key
+            unique_key = scene_key
+            ad_prompts[unique_key] = prompt
+            
+            # Store character information for this shot
+            ad_character_info[unique_key] = {
+                "detected_characters": detected_characters,
+                "lora_type": lora_type,
+                "lora_value": lora_value,
+                "character_pair": character_pair
+            }
+            
+            print(f"🖼️ Generating image for {unique_key}" + 
+                  (f" using {lora_type} LoRA: {lora_value}" if lora_value else " without LoRA"))
+            
+            # Set seed: reuse same seed within the scene
+            scene_seed = None
+            if scene_key in state.scene_seeds:
+                scene_seed = state.scene_seeds[scene_key]
+                print(f"Found stored seed {scene_seed} for {scene_key}")
+                image_url, _ = generate_flux_image(prompt, hf_lora=lora_value, seed=scene_seed)
+                last_generated_seed = scene_seed
+            else:
+                print(f"========== CHARACTER SCENE IMAGE GENERATION ==========")
+                print(f"Shot key: {unique_key}")
+                print(f"Image prompt: {prompt}")
+                print(f"Characters in shot: {detected_characters}")
+                print(f"LoRA type: {lora_type}")
+                print(f"LoRA value: {lora_value}")
+                print(f"Character pair: {character_pair}")
+                print(f"Generating first image in scene (seed will be auto-generated)")
+                image_url, used_seed = generate_flux_image(prompt, hf_lora=lora_value)
+                if used_seed is not None:
+                    scene_seed = used_seed
+                    last_generated_seed = used_seed
+                    # Save the seed in state.scene_seeds
+                    state.scene_seeds[scene_key] = scene_seed
+                    print(f"Generated seed {scene_seed} will be used for subsequent shots in this scene")
+            
+            if not image_url:
+                print(f"❌ Failed to generate image for {unique_key}.")
+            else:
+                print(f"✅ {unique_key} → {image_url[:50]}...")
+            
+            ad_images[unique_key] = image_url
     
     # If no scene_scripts or if we need more images, generate from episodes
     if not ad_images and state.episodes:

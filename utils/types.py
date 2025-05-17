@@ -12,6 +12,7 @@ class StoryState(BaseModel):
     ad_images: Dict[str, str] = {}
     ad_character_info: Dict[str, Dict[str, Any]] = {}  # Stores character info for each shot
     scene_seeds: Dict[str, int] = {}  # Stores seeds for scene images
+    last_generated_seed: Any = None   # Stores the last seed used for image generation
 
 
     # High-level metadata

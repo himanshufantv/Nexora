@@ -822,32 +822,43 @@ Format each as: "Character Name, brief description"
                     
                     response_text = f"# Scene {scene_number} from Episode {episode_number}\n\n"
                     
-                    # Get scene information
-                    if (hasattr(updated_state, "structured_scenes") and 
-                        episode_number in updated_state.structured_scenes):
-                        
-                        matching_scene = None
-                        for scene in updated_state.structured_scenes[episode_number]:
-                            if str(scene.get("scene_number", "")) == scene_number:
-                                matching_scene = scene
-                                break
-                        
-                        if matching_scene:
-                            scene_title = matching_scene.get("title", "")
-                            scene_desc = matching_scene.get("description", "")
-                            response_text += f"## {scene_title}\n\n{scene_desc}\n\n"
-                        else:
-                            response_text += "Scene details not found."
-                    
-                    # Try to get from episode_scripts as fallback
-                    elif (hasattr(updated_state, "episode_scripts") and 
-                          episode_number in updated_state.episode_scripts and
-                          len(updated_state.episode_scripts[episode_number]) >= int(scene_number)):
-                        
-                        scene_text = updated_state.episode_scripts[episode_number][int(scene_number)-1]
-                        response_text += f"{scene_text}\n\n"
+                    # First check if there's a last_agent_output in the updated state
+                    if hasattr(updated_state, "last_agent_output") and updated_state.last_agent_output:
+                        response_text = updated_state.last_agent_output
                     else:
-                        response_text += "Scene details not available."
+                        # Get scene description from structured_scenes
+                        scene_description = ""
+                        episode_str = str(episode_number)
+                        
+                        if hasattr(updated_state, "structured_scenes") and episode_str in updated_state.structured_scenes:
+                            for scene in updated_state.structured_scenes[episode_str]:
+                                if scene.get("scene_number") == scene_number:
+                                    scene_description = scene.get("description", "")
+                                    break
+                        
+                        # Fallback to scene_scripts if structured_scenes doesn't have the description
+                        if not scene_description:
+                            scene_key = f"ep{episode_number}_scene{scene_number}"
+                            scene_script = []
+                            
+                            if hasattr(updated_state, "scene_scripts") and scene_key in updated_state.scene_scripts:
+                                scene_script = updated_state.scene_scripts[scene_key]
+                            
+                            # Format script response
+                            response_text = f"# Scene {scene_number} from Episode {episode_number}\n\n"
+                            
+                            for i, shot in enumerate(scene_script):
+                                shot_desc = shot.get("shot", "")
+                                shot_dialogue = shot.get("dialogue", "")
+                                
+                                response_text += f"## Shot {i+1}\n\n"
+                                response_text += f"{shot_desc}\n\n"
+                                
+                                if shot_dialogue:
+                                    response_text += f"**Dialogue:** {shot_dialogue}\n\n"
+                        else:
+                            # Use the scene description from structured_scenes
+                            response_text = f"# Scene {scene_number} from Episode {episode_number}\n\n{scene_description}"
                 
                 # Ensure there's always a response
                 if not response_text:
@@ -926,25 +937,43 @@ Format each as: "Character Name, brief description"
                     ep_num = int(episode_match.group(1)) if episode_match else 1
                     scene_num = int(scene_match.group(1)) if scene_match else 1
                     
-                    # Get scene description from scene_scripts
-                    scene_key = f"ep{ep_num}_scene{scene_num}"
-                    scene_script = []
-                    
-                    if hasattr(updated_state, "scene_scripts") and scene_key in updated_state.scene_scripts:
-                        scene_script = updated_state.scene_scripts[scene_key]
-                    
-                    # Format script response
-                    response_text = f"# Scene {scene_num} from Episode {ep_num}\n\n"
-                    
-                    for i, shot in enumerate(scene_script):
-                        shot_desc = shot.get("shot", "")
-                        shot_dialogue = shot.get("dialogue", "")
+                    # First check if there's a last_agent_output in the updated state
+                    if hasattr(updated_state, "last_agent_output") and updated_state.last_agent_output:
+                        response_text = updated_state.last_agent_output
+                    else:
+                        # Get scene description from structured_scenes
+                        scene_description = ""
+                        episode_str = str(ep_num)
                         
-                        response_text += f"## Shot {i+1}\n\n"
-                        response_text += f"{shot_desc}\n\n"
+                        if hasattr(updated_state, "structured_scenes") and episode_str in updated_state.structured_scenes:
+                            for scene in updated_state.structured_scenes[episode_str]:
+                                if scene.get("scene_number") == scene_num:
+                                    scene_description = scene.get("description", "")
+                                    break
                         
-                        if shot_dialogue:
-                            response_text += f"**Dialogue:** {shot_dialogue}\n\n"
+                        # Fallback to scene_scripts if structured_scenes doesn't have the description
+                        if not scene_description:
+                            scene_key = f"ep{ep_num}_scene{scene_num}"
+                            scene_script = []
+                            
+                            if hasattr(updated_state, "scene_scripts") and scene_key in updated_state.scene_scripts:
+                                scene_script = updated_state.scene_scripts[scene_key]
+                            
+                            # Format script response
+                            response_text = f"# Scene {scene_num} from Episode {ep_num}\n\n"
+                            
+                            for i, shot in enumerate(scene_script):
+                                shot_desc = shot.get("shot", "")
+                                shot_dialogue = shot.get("dialogue", "")
+                                
+                                response_text += f"## Shot {i+1}\n\n"
+                                response_text += f"{shot_desc}\n\n"
+                                
+                                if shot_dialogue:
+                                    response_text += f"**Dialogue:** {shot_dialogue}\n\n"
+                        else:
+                            # Use the scene description from structured_scenes
+                            response_text = f"# Scene {scene_num} from Episode {ep_num}\n\n{scene_description}"
             else:
                 updated_state = agent_fn(state)
                 # Default handling for other agents

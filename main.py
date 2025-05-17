@@ -7,15 +7,21 @@ from agents.casting import casting_agent
 from agents.ad import ad_agent
 from agents.video_design import video_design_agent
 from agents.editor import editor_agent
+from agents.storyboard import storyboard_agent
 from utils.types import StoryState
 from utils.chat_logger import start_new_session_log, log_chat_turn
 from db.models.chat_sessions import create_chat_session, log_chat_message
 from db.models.story_projects import save_story_project
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import os
 from api.project_api import router as project_router
 
 app = FastAPI()
+
+# Make sure videos directory exists
+os.makedirs("videos", exist_ok=True)
 
 # Configure CORS
 app.add_middleware(
@@ -26,6 +32,9 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+# Mount the videos directory for serving video files
+app.mount("/videos", StaticFiles(directory="videos"), name="videos")
+
 app.include_router(project_router)
 AGENTS = {
     "Writer": writer_agent,
@@ -34,6 +43,7 @@ AGENTS = {
     "AD": ad_agent,
     "VideoDesign": video_design_agent,
     "Editor": editor_agent,
+    "Storyboard": storyboard_agent,
 }
 
 def run_interactive_chat():
@@ -66,7 +76,11 @@ def run_interactive_chat():
         else:
             agent_name = agent_key
             agent_fn = AGENTS.get(agent_key)
-            state = agent_fn(state)
+            # Handle storyboard agent separately since it requires user_message
+            if agent_name == "Storyboard":
+                state = agent_fn(state, user_input)
+            else:
+                state = agent_fn(state)
 
         # Handle logging
         if agent_name == "Writer":
